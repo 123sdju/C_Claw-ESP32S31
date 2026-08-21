@@ -4,7 +4,7 @@
 传输层、产品工具、OTA、摄像头、LCD、USB、Lua 和设备配置。
 
 通用 Agent Runtime 不在本仓库复制维护，而是通过
-`third_party/cclaw-sdk` 固定依赖 `C_Claw` SDK。产品仓库可以使用 SDK 的公共
+`third_party/cclaw-sdk` 固定依赖 `C_Claw-SDK`。产品仓库可以使用 SDK 的公共
 `CClaw::runtime` target 和 `cc/` 公共头文件，但不应引用 SDK 的 `src/` 内部实现。
 
 ## 仓库结构
@@ -27,3 +27,7 @@ idf.py build
 submodule 指针。
 
 当前目录是从现有 CClaw 工程整理出的产品初始快照；本目录的 ESP-IDF 构建和硬件运行尚未执行验证。
+
+## License
+
+MIT License，详见根目录 `LICENSE`。ESP-IDF 和其他第三方组件仍以其各自的许可证为准。
