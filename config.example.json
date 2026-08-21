@@ -1,0 +1,61 @@
+{
+  "model": {
+    "provider": "openai",
+    "name": "<model-name>",
+    "base_url": "https://api.example.invalid",
+    "api_key": "<set-at-runtime>",
+    "tls": {
+      "verify": true
+    },
+    "capabilities": {
+      "input": {
+        "image": true,
+        "audio": false,
+        "video": false,
+        "file": false
+      },
+      "output": {
+        "image": false,
+        "audio": false,
+        "video": false,
+        "file": false
+      }
+    }
+  },
+  "runtime": {
+    "stream": true,
+    "thinking": true,
+    "max_steps": 4,
+    "run_timeout_ms": 180000,
+    "provider_timeout_ms": 120000,
+    "tool_timeout_ms": 10000,
+    "queue_depth": 8,
+    "max_input_bytes": 1024,
+    "max_output_bytes": 32768,
+    "max_stream_bytes": 32768,
+    "max_tool_result_bytes": 16384,
+    "max_concurrency": 1,
+    "web_enabled": true,
+    "web_port": 80,
+    "session_id": "esp32s31-main",
+    "context_window_tokens": 8192,
+    "context_compress_threshold": 0.6,
+    "context_keep_recent": 6
+  },
+  "workspace": {
+    "root": "/usb0/workspace"
+  },
+  "storage": {
+    "root": "/usb0/cclaw",
+    "sessions": "/usb0/cclaw/sessions",
+    "memory": "/usb0/cclaw/memory.json",
+    "logs": "/usb0/cclaw/logs"
+  },
+  "network": {
+    "sta": {
+      "enabled": true,
+      "ssid": "<set-at-runtime>",
+      "password": "<set-at-runtime>"
+    }
+  }
+}

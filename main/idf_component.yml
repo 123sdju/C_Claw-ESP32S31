@@ -1,0 +1,16 @@
+dependencies:
+  idf: ">=5.4.3"
+  espressif/esp_board_manager:
+    version: "^0.5.13"
+    require: public
+  espressif/esp_cam_sensor:
+    version: "^2.1.0"
+    require: public
+  espressif/esp_lvgl_adapter: "*"
+  espressif/lua:
+    version: "^5.5.0"
+    require: public
+  espressif/mdns:
+    version: "^1.8.0"
+    require: public
+  usb_host_msc: "^1.1.4"

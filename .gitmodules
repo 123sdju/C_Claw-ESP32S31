@@ -1,0 +1,3 @@
+[submodule "third_party/cclaw-sdk"]
+	path = third_party/cclaw-sdk
+	url = ../C_Claw-SDK
