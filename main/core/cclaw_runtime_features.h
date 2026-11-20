@@ -2,14 +2,11 @@
 
 #include "cc/app/cc_runtime_features.h"
 
-/*
- * 获取 CClaw 应用层合并后的运行时 feature set。
- *
- * 返回: 指向静态存储的 cc_runtime_feature_set_t 指针，包含 SDK 内置工具
- *       （如 file_read、file_write、http.request、memory）与应用层工具
- *       （camera_capture、lua_run_code、screen_draw 等）的合并结果。
- *
- * 首次调用触发线程安全的懒初始化（双重检查锁定），后续调用直接返回缓存。
- * 返回指针在应用生命周期内有效。
+/**
+ * @brief 获取合并 SDK 和应用工具、执行只读记忆策略后的 feature 集合。
+ * @return 进程期有效的只读借用指针，由内部持有。首次工具数组分配失败时，
+ *         集合保留其他 feature，工具列表为空，并将此结果用于后续调用。
+ * @note 首次调用同步合并描述符，竞争者自旋等待，完成后以 acquire/release 发布。
+ *       调用者可并发读取，builder 和 generation 可在整个存活期借用集合及其数组。
  */
 const cc_runtime_feature_set_t *cclaw_runtime_features(void);

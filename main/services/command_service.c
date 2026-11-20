@@ -7,17 +7,13 @@
 
 #include "app_profile.h"
 #include "app_event_bus.h"
-#include "cc/core/cc_result.h"
-#include "cc/ports/cc_filesystem.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
-#include "lua_runtime.h"
 
-/*
- * 将 ASCII 字符串的前导和尾部空白字符（空格、制表符、回车、换行）去除。
- * 原地修改字符串，返回调整后的起始指针。
- * 参数: text - 输入字符串
- * 返回: 去除空白后的起始位置，NULL 输入返回 NULL
+/**
+ * @brief 跳过前导 ASCII 空白并原地终止尾部空白。
+ * @param[in,out] text 可为 NULL 的可写 NUL 文本，识别空格、制表、回车和换行。
+ * @return 原缓冲内首个非空白位置，NULL 输入返回 NULL，调用者继续持有原分配地址。
  */
 static char *trim_ascii(char *text)
 {
@@ -30,20 +26,21 @@ static char *trim_ascii(char *text)
     return text;
 }
 
-/*
- * 发布一条状态事件到事件总线（APP_EVENT_KIND_STATUS，日志级别 INFO）。
- * 参数: source - 事件来源
- * 参数: text   - 状态文本
+/**
+ * @brief 同步向产品事件入口发布 INFO 状态文本。
+ * @param[in] source 事件来源枚举。
+ * @param[in] text 本次调用期间借用的 NUL 文本。
+ * @post 事件入口按自身接纳规则复制内容，调用者继续持有原文。
  */
 static void publish_status(app_event_source_t source, const char *text)
 {
     app_event_publish(APP_EVENT_KIND_STATUS, source, CC_LOG_INFO, text);
 }
 
-/*
- * 处理 /heap 命令：通过 app_event_publishf 发布当前堆内存统计信息
- * （free_heap、min_free_heap、internal_free、psram_free、psram_largest）。
- * 参数: source - 事件来源
+/**
+ * @brief 发布通用堆最低余量、内部堆和 PSRAM 可用量及最大连续块。
+ * @param[in] source 接收本次 INFO 状态事件的来源。
+ * @post 各统计为原生读取瞬间的字节数，读取之间其他任务仍可分配或释放。
  */
 static void handle_heap_command(app_event_source_t source)
 {
@@ -59,9 +56,10 @@ static void handle_heap_command(app_event_source_t source)
                        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
 
-/*
- * 处理 /profile 命令（无子命令时）：发布当前 profile 的启用状态和采样级别。
- * 参数: source - 事件来源
+/**
+ * @brief 发布采样器当前启用状态和级别。
+ * @param[in] source 本次 INFO 状态事件来源。
+ * @post 两个查询各自取得瞬时值，函数不启动或停止采样。
  */
 static void handle_profile_status(app_event_source_t source)
 {
@@ -73,66 +71,13 @@ static void handle_profile_status(app_event_source_t source)
                        app_profile_level_string(app_profile_level()));
 }
 
-/*
- * 处理 /lua <code> 命令：在沙箱中执行 Lua 代码字符串，发布执行结果或错误。
- * 参数: source - 事件来源
- * 参数: code   - Lua 源码字符串
- */
-static void handle_lua_code(app_event_source_t source, const char *code)
-{
-    lua_runtime_limits_t limits = lua_runtime_default_limits();
-    char *lua_output = NULL;
-    cc_result_t rc = lua_runtime_run_code(code, &limits, &lua_output);
-    if (rc.code == CC_OK) {
-        app_event_publish(APP_EVENT_KIND_TOOL, source, CC_LOG_INFO, lua_output ? lua_output : "lua ok");
-    } else {
-        app_event_publish(APP_EVENT_KIND_ERROR,
-                          source,
-                          CC_LOG_ERROR,
-                          rc.message ? rc.message : cc_error_string(rc.code));
-    }
-    heap_caps_free(lua_output);
-    cc_result_free(&rc);
-}
-
-/*
- * 处理 /luafile <path> 命令：从文件系统加载并执行 Lua 脚本。
- * 参数: source - 事件来源
- * 参数: path   - Lua 文件路径
- */
-static void handle_lua_file(app_event_source_t source, const char *path)
-{
-    lua_runtime_limits_t limits = lua_runtime_default_limits();
-    char *lua_output = NULL;
-    cc_filesystem_t filesystem = {0};
-    cc_result_t rc = cc_filesystem_get_default(&filesystem);
-    if (rc.code == CC_OK) {
-        cc_result_free(&rc);
-        rc = lua_runtime_run_file(&filesystem, NULL, path, &limits, &lua_output);
-    }
-    if (rc.code == CC_OK) {
-        app_event_publish(APP_EVENT_KIND_TOOL, source, CC_LOG_INFO, lua_output ? lua_output : "lua file ok");
-    } else {
-        app_event_publish(APP_EVENT_KIND_ERROR,
-                          source,
-                          CC_LOG_ERROR,
-                          rc.message ? rc.message : cc_error_string(rc.code));
-    }
-    heap_caps_free(lua_output);
-    cc_result_free(&rc);
-    if (filesystem.vtable && filesystem.vtable->destroy) {
-        filesystem.vtable->destroy(filesystem.self);
-    }
-}
-
-/*
- * 解析并执行命令行文本。支持以下命令前缀：
- * /help、/heap、/clear、/debug on|off|、/profile on|off|sample|level|interval、
- * /thinking on|off、/lua <code>、/luafile <path>、/stream on|off、/exit。
- * 参数: ctx  - 上下文（运行时指针、事件来源），可为 NULL（默认 source=SYSTEM）
- * 参数: text - 命令行文本（不以 '/' 开头直接返回 NOT_HANDLED）
- * 返回: COMMAND_SERVICE_HANDLED 已处理，COMMAND_SERVICE_CLEAR 需清屏，
- *       COMMAND_SERVICE_NOT_HANDLED 非命令文本
+/**
+ * @brief 执行本地状态、采样、调试和思考命令，并将清屏交给 owner。
+ * @param[in] ctx 可为 NULL 的调用期借用上下文，缺省来源为 SYSTEM，runtime 可为 NULL。
+ * @param[in,out] text 可为 NULL 的可写 NUL 文本，interval 参数会原地去除尾部空白。
+ * @return 已发布结果为 HANDLED，/clear 为 CLEAR，未知斜杠命令及普通文本为 NOT_HANDLED。
+ * @pre owner 保证 runtime 在本次调用结束前存活，并协调其代际租约。
+ * @note 手动 Lua 由交互层携操作账本执行，直接交给本解析器时返回已处理错误提示。
  */
 command_service_result_t command_service_handle(const command_service_context_t *ctx, char *text)
 {
@@ -224,28 +169,34 @@ command_service_result_t command_service_handle(const command_service_context_t 
         return COMMAND_SERVICE_HANDLED;
     }
     if (strcmp(text, "/thinking on") == 0) {
-        if (runtime) cc_agent_runtime_set_thinking_mode(runtime, 1);
+        if (!runtime) {
+            app_event_publish(APP_EVENT_KIND_ERROR, source, CC_LOG_WARN, "runtime unavailable");
+            return COMMAND_SERVICE_HANDLED;
+        }
+        cc_agent_runtime_set_thinking_mode(runtime, 1);
         publish_status(source, "thinking on");
         return COMMAND_SERVICE_HANDLED;
     }
     if (strcmp(text, "/thinking off") == 0) {
-        if (runtime) cc_agent_runtime_set_thinking_mode(runtime, 0);
+        if (!runtime) {
+            app_event_publish(APP_EVENT_KIND_ERROR, source, CC_LOG_WARN, "runtime unavailable");
+            return COMMAND_SERVICE_HANDLED;
+        }
+        cc_agent_runtime_set_thinking_mode(runtime, 0);
         publish_status(source, "thinking off");
         return COMMAND_SERVICE_HANDLED;
     }
-    if (strncmp(text, "/lua ", 5) == 0) {
-        handle_lua_code(source, text + 5);
-        return COMMAND_SERVICE_HANDLED;
-    }
-    if (strncmp(text, "/luafile ", 9) == 0) {
-        handle_lua_file(source, trim_ascii(text + 9));
+    if (strcmp(text, "/lua") == 0 || strcmp(text, "/luafile") == 0 ||
+        strncmp(text, "/lua ", 5) == 0 || strncmp(text, "/luafile ", 9) == 0) {
+        app_event_publish(APP_EVENT_KIND_ERROR, source, CC_LOG_WARN,
+                          "手动 Lua 需要通过交互服务核对当前 U 盘操作账本。");
         return COMMAND_SERVICE_HANDLED;
     }
     if (strcmp(text, "/stream on") == 0 || strcmp(text, "/stream off") == 0) {
         publish_status(source, "stream follows route config");
         return COMMAND_SERVICE_HANDLED;
     }
-    if (strcmp(text, "/exit") == 0 || strcmp(text, "exit") == 0) {
+    if (strcmp(text, "/exit") == 0) {
         publish_status(source, "console remains active");
         return COMMAND_SERVICE_HANDLED;
     }

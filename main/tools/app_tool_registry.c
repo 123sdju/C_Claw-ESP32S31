@@ -13,11 +13,11 @@ static const cc_tool_descriptor_t s_app_tools[] = {
     {"screen_draw", "display", 1, screen_tool_create},
 };
 
-/*
- * 返回应用层工具描述符数组，包含 6 个工具（camera_capture / lua_run_code / lua_run_file /
- * lua_driver_info / lua_script_search / screen_draw），供运行时工具注册使用。
- * 参数: out_count - [出参] 接收工具描述符数量，可为 NULL
- * 返回: 静态工具描述符数组首地址
+/**
+ * @brief 查询摄像头、Lua 和屏幕的六个应用工具描述符。
+ * @param[out] out_count 可选输出，接收静态数组的元素数，允许 NULL。
+ * @return 进程期有效的只读借用数组，工厂在 generation 装配时才创建工具实例。
+ * @note 查询使用不可变静态数组，可并发调用。调用者按 count 遍历，数组按固定长度保存。
  */
 const cc_tool_descriptor_t *app_tool_registry_descriptors(size_t *out_count)
 {

@@ -15,10 +15,11 @@ typedef struct {
     network_service_status_t network;      /* 网络连接状态（WiFi、IP 等） */
 } app_status_t;
 
-/*
- * 从各子系统采集当前运行时状态，填充到 out_status。
- *
- * 参数:
- *   out_status - 输出参数，接收状态快照。为 NULL 则无操作。
+/**
+ * @brief 采集时间、USB 挂载、摄像头和网络的状态值。
+ * @param[out] out_status 由调用者独占的输出结构体，NULL 时直接返回。
+ * @post 非空输出先清零再填充，调用者可按值保存或复制。
+ * @note 子系统分次查询，各字段允许存在时间偏差。查询可能等待子系统锁，
+ *       应从任务上下文调用，并在跨任务共享输出时由调用者同步。
  */
 void app_status_collect(app_status_t *out_status);

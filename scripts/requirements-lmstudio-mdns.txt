@@ -1,0 +1,2 @@
+zeroconf==0.151.3
+ifaddr==0.2.0

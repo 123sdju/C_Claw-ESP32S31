@@ -10,11 +10,11 @@
 
 #define WEB_PROFILE_SLOW_US 200000ULL
 
-/*
- * 性能剖析辅助函数：若 span 启用且耗时超过 200ms（WEB_PROFILE_SLOW_US）
- * 或状态不是 "ok"，则结束 span 并标记相应状态。用于检测慢速 API 调用。
- * 参数: span   - 性能剖析 span 对象
- *       status - 操作状态（"ok" 或错误原因）
+/**
+ * @brief 为启用的请求 span 记录失败或至少二百毫秒的慢调用。
+ * @param[in,out] span 借用 span，NULL 或未启用时跳过。
+ * @param[in] status 借用状态，非 NULL 且非 ok 时原样结束，否则只记录慢调用。
+ * @post 满足条件时调用 profile 结束入口，普通快速成功保持无记录，无资源移交。
  */
 static void web_profile_span_end_if_slow(app_profile_span_t *span, const char *status)
 {
@@ -31,11 +31,11 @@ static void web_profile_span_end_if_slow(app_profile_span_t *span, const char *s
     }
 }
 
-/*
- * 处理 GET /api/status 请求。调用上下文 status_json 回调获取设备运行时状态 JSON，
- * 以 application/json 类型返回。回调全部通过 free() 释放。
- * 参数: req - HTTP 请求句柄
- * 返回: ESP_OK 表示成功；若回调未设置或返回 NULL 则返回 500
+/**
+ * @brief 请求业务状态快照，发送后释放回调交付的拥有正文。
+ * @param[in,out] req HTTPD 借用请求，寿命覆盖同步回调和响应发送。
+ * @return 响应发送结果，缺回调或 NULL 正文形成 HTTP 500，HTTP 错误响应也可能发送成功。
+ * @note 回调和 user_data 由 Web 生命周期保活，正文按 free 清理，慢成功或发送失败记录 profile。
  */
 esp_err_t web_console_status_handler(httpd_req_t *req)
 {
@@ -57,12 +57,11 @@ esp_err_t web_console_status_handler(httpd_req_t *req)
     return err;
 }
 
-/*
- * 处理 GET /api/events 请求。支持查询参数 since（起始序列号）、limit（最大条数，
- * 默认来自 io 配置或 120）和 kind（事件种类掩码，默认 APP_EVENT_KIND_MASK_ALL），
- * 调用 events_json 回调获取事件 JSON 并返回。
- * 参数: req - HTTP 请求句柄（含可选查询参数）
- * 返回: ESP_OK 表示成功；若回调未设置或返回 NULL 则返回 500
+/**
+ * @brief 解析事件查询参数，缺省条数从当前原子热限制读取，再请求业务事件快照。
+ * @param[in,out] req HTTPD 借用请求，查询支持 since、limit 和 kind。
+ * @return 响应发送结果，回调缺失或 NULL 正文形成 HTTP 500。
+ * @note 查询值副本以 heap_caps_free 清理，回调正文以 free 清理。显式数值沿现有 strtoul/atoi 宽松解析，范围由事件 owner 处理。
  */
 esp_err_t web_console_events_handler(httpd_req_t *req)
 {
@@ -77,7 +76,7 @@ esp_err_t web_console_events_handler(httpd_req_t *req)
     char *kind_text = web_console_query_value(req, "kind");
     uint32_t since = since_text ? (uint32_t)strtoul(since_text, NULL, 10) : 0;
     int limit = limit_text ? atoi(limit_text) :
-        (g_web_console_context.io ? g_web_console_context.io->web.event_limit : 120);
+        web_console_event_limit();
     uint32_t kind_mask = kind_text ? (uint32_t)strtoul(kind_text, NULL, 0) : APP_EVENT_KIND_MASK_ALL;
     heap_caps_free(since_text);
     heap_caps_free(limit_text);
@@ -98,11 +97,11 @@ esp_err_t web_console_events_handler(httpd_req_t *req)
     return err;
 }
 
-/*
- * 处理 POST /api/messages 请求。接收请求体文本，通过 message_submitted 回调
- * 提交到交互服务处理。请求体大小受 io->max_input_bytes 限制（默认 1024）。
- * 参数: req - HTTP 请求句柄（content_len 为消息文本长度）
- * 返回: ESP_OK 且提交成功返回 {"ok":true,"queued":true}；超限或失败返回错误
+/**
+ * @brief 用本请求开始时的原子字节上限检查消息，接收完整正文后同步提交。
+ * @param[in,out] req 必需 HTTPD 借用请求，content_len 为正且不超过当前限制才接收。
+ * @return 响应发送结果，提交成功发送 queued 正文，超限或业务拒绝为 HTTP 400，接收失败/OOM 为 500，总期限为 408。
+ * @note PSRAM 正文追加 NUL 后仅在回调期间借用，所有路径以 heap_caps_free 清理；超时 recv 可重试至六十秒总期限。
  */
 esp_err_t web_console_input_handler(httpd_req_t *req)
 {
@@ -112,8 +111,7 @@ esp_err_t web_console_input_handler(httpd_req_t *req)
         return web_console_send_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "message unavailable");
     }
 
-    int max_input_bytes = g_web_console_context.io ?
-        g_web_console_context.io->max_input_bytes : 1024;
+    int max_input_bytes = web_console_max_input_bytes();
     if (req->content_len <= 0 || req->content_len > max_input_bytes) {
         app_profile_span_end(&span, "bad_size");
         return web_console_send_error(req, HTTPD_400_BAD_REQUEST, "bad message size");
@@ -127,7 +125,13 @@ esp_err_t web_console_input_handler(httpd_req_t *req)
 
     int remaining = req->content_len;
     char *write = buf;
+    int64_t deadline = esp_timer_get_time() + WEB_REQUEST_TIMEOUT_US;
     while (remaining > 0) {
+        if (esp_timer_get_time() >= deadline) {
+            heap_caps_free(buf);
+            app_profile_span_end(&span, "recv_timeout");
+            return web_console_send_error(req, HTTPD_408_REQ_TIMEOUT, "message upload deadline exceeded");
+        }
         int n = httpd_req_recv(req, write, remaining);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;

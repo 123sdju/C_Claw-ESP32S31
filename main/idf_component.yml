@@ -1,3 +1,6 @@
+# main 组件的依赖声明，由 ESP-IDF 组件管理器在配置阶段解析。
+# 约束表达本工程允许的版本范围，实际解析版本与校验信息见工程 dependencies.lock。
+# BSP、相机、LVGL 适配、Lua、mDNS、视频和 USB MSC 由相应上游组件提供。
 dependencies:
   idf: ">=5.4.3"
   espressif/esp_board_manager:
@@ -6,11 +9,15 @@ dependencies:
   espressif/esp_cam_sensor:
     version: "^2.1.0"
     require: public
+  # 此项沿现有任意版本约束，复现构建时同时核对锁文件和已安装组件。
   espressif/esp_lvgl_adapter: "*"
   espressif/lua:
     version: "^5.5.0"
     require: public
   espressif/mdns:
     version: "^1.8.0"
+    require: public
+  espressif/esp_video:
+    version: "^2.5.0"
     require: public
   usb_host_msc: "^1.1.4"

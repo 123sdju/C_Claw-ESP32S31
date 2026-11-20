@@ -1,11 +1,17 @@
 {
   "model": {
     "provider": "openai",
-    "name": "<model-name>",
-    "base_url": "https://api.example.invalid",
-    "api_key": "<set-at-runtime>",
+    "name": "qwen3.5",
+    "base_url": "",
     "tls": {
       "verify": true
+    },
+    "max_tokens": 512,
+    "temperature": 0.2,
+    "extra_body": {
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
     },
     "capabilities": {
       "input": {
@@ -20,7 +26,8 @@
         "video": false,
         "file": false
       }
-    }
+    },
+    "api_key": ""
   },
   "runtime": {
     "stream": true,
@@ -35,27 +42,216 @@
     "max_stream_bytes": 32768,
     "max_tool_result_bytes": 16384,
     "max_concurrency": 1,
+    "max_pending_operations": 64,
     "web_enabled": true,
     "web_port": 80,
+    "event_limit": 120,
     "session_id": "esp32s31-main",
     "context_window_tokens": 8192,
     "context_compress_threshold": 0.6,
-    "context_keep_recent": 6
+    "context_keep_recent": 6,
+    "summary_max_tokens": 256,
+    "summary_temperature": 0.2
+  },
+  "system": {
+    "prompt": "You are C-Claw running on ESP32S31. Keep responses short, hardware-aware, and tool-safe. The LCD has a live console for user input, assistant output, thinking, and tool events. Use screen_draw when the user asks you to write, draw, clear, or annotate the screen. Use lua_driver_info before writing Lua that touches C-Claw Lua drivers, and use lua_script_search before creating or running Lua files to find reusable workspace scripts. Use lua_run_code for short Lua scripts. For larger Lua scripts, first call file_write with a path like lua/name.lua, then call lua_script_search to confirm it is discoverable, then call lua_run_file with that same path. When the user asks about the current scene or camera view, call camera_capture and use at most one small image input per turn.",
+    "soul_file": "",
+    "user_file": "",
+    "debug": false
+  },
+  "profile": {
+    "enabled": true,
+    "level": "basic",
+    "interval_ms": 5000
   },
   "workspace": {
     "root": "/usb0/workspace"
   },
   "storage": {
     "root": "/usb0/cclaw",
+    "session_backend": "json_segmented",
     "sessions": "/usb0/cclaw/sessions",
+    "session_segment_bytes": 262144,
+    "session_media_dir": "media",
+    "memory_backend": "json_file",
     "memory": "/usb0/cclaw/memory.json",
-    "logs": "/usb0/cclaw/logs"
+    "logs": "/usb0/cclaw/logs",
+    "managed_memory": {
+      "capacity": 100,
+      "pending_items": 4,
+      "pending_bytes": 262144
+    },
+    "summary_cache": {
+      "per_session": 8,
+      "max_entries": 128,
+      "max_bytes": 524288
+    }
   },
   "network": {
     "sta": {
       "enabled": true,
-      "ssid": "<set-at-runtime>",
-      "password": "<set-at-runtime>"
+      "ssid": "",
+      "connect_timeout_ms": 20000,
+      "max_retry": 5,
+      "password": ""
+    },
+    "ap": {
+      "enabled": false,
+      "ssid": "",
+      "password": "",
+      "channel": 6,
+      "max_connections": 4
+    },
+    "mdns": {
+      "enabled": true,
+      "hostname": ""
+    },
+    "http": {
+      "connect_timeout_ms": 10000,
+      "first_byte_timeout_ms": 15000,
+      "stream_idle_timeout_ms": 90000,
+      "retry_count": 0,
+      "log_level": "warn",
+      "trace": {
+        "persist": true
+      }
+    }
+  },
+  "events": {
+    "serial": {
+      "enabled": true,
+      "level": "info"
+    },
+    "display": {
+      "enabled": true
+    },
+    "usb_log": {
+      "enabled": true,
+      "dir": "/usb0/cclaw/logs",
+      "max_bytes": 524288,
+      "max_files": 20,
+      "level": "info"
+    },
+    "routes": {
+      "log": [
+        "serial",
+        "web",
+        "usb_log"
+      ],
+      "chat": [
+        "serial",
+        "web",
+        "display"
+      ],
+      "thinking": [
+        "serial",
+        "web",
+        "display",
+        "usb_log"
+      ],
+      "tool": [
+        "serial",
+        "web",
+        "display"
+      ],
+      "status": [
+        "serial",
+        "web",
+        "display"
+      ],
+      "error": [
+        "serial",
+        "web",
+        "display",
+        "usb_log"
+      ],
+      "profile": [
+        "web",
+        "usb_log"
+      ]
+    }
+  },
+  "display": {
+    "font_path": "/usb0/cclaw/fonts/default.bin"
+  },
+  "camera": {
+    "default_quality": 70,
+    "default_save_path": "camera.jpg"
+  },
+  "multimodal": {
+    "input": {
+      "image": true,
+      "audio": false,
+      "video": false,
+      "file": false
+    },
+    "output": {
+      "image": false,
+      "audio": false,
+      "video": false,
+      "file": false
+    },
+    "limits": {
+      "max_artifacts": 1,
+      "max_artifact_bytes": 65536,
+      "max_base64_bytes": 90112,
+      "allow_inline_base64": true,
+      "allowed_mime_prefixes": [
+        "image/jpeg",
+        "image/png"
+      ]
+    }
+  },
+  "tools": {
+    "enabled": [
+      "file_read",
+      "file_write",
+      "camera_capture",
+      "screen_draw",
+      "lua_run_code",
+      "lua_run_file",
+      "lua_driver_info",
+      "lua_script_search",
+      "memory"
+    ],
+    "default_timeout_ms": 10000,
+    "policies": {
+      "camera_capture": {
+        "concurrency": 1,
+        "timeout_ms": 15000
+      },
+      "screen_draw": {
+        "concurrency": 1,
+        "timeout_ms": 3000
+      },
+      "lua_run_code": {
+        "concurrency": 1,
+        "timeout_ms": 1000
+      },
+      "lua_run_file": {
+        "concurrency": 1,
+        "timeout_ms": 1000
+      },
+      "lua_driver_info": {
+        "concurrency": 1,
+        "timeout_ms": 1000
+      },
+      "lua_script_search": {
+        "concurrency": 1,
+        "timeout_ms": 1000
+      },
+      "file_read": {
+        "concurrency": 1,
+        "timeout_ms": 10000
+      },
+      "file_write": {
+        "concurrency": 1,
+        "timeout_ms": 10000
+      },
+      "memory": {
+        "concurrency": 1,
+        "timeout_ms": 5000
+      }
     }
   }
 }

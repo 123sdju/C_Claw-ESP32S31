@@ -27,10 +27,10 @@ typedef struct {
     char save_path[CAMERA_TOOL_SAVE_PATH_MAX];
 } camera_tool_args_t;
 
-/*
- * 返回工具名称标识符。
- * 参数: self - 工具实例指针（未使用）
- * 返回: 固定字符串 "camera_capture"
+/**
+ * @brief 查询摄像头工具名称。
+ * @param[in] self 未使用实例借用，可 NULL。
+ * @return 常驻只读名称借用，无分配，可并发。
  */
 static const char *camera_tool_name(void *self)
 {
@@ -38,10 +38,10 @@ static const char *camera_tool_name(void *self)
     return "camera_capture";
 }
 
-/*
- * 返回工具功能描述字符串，提供给 Agent 理解工具用途。
- * 参数: self - 工具实例指针（未使用）
- * 返回: 英文描述字符串
+/**
+ * @brief 查询采集功能描述。
+ * @param[in] self 未使用实例借用，可 NULL。
+ * @return 常驻只读描述借用，无分配，可并发。
  */
 static const char *camera_tool_description(void *self)
 {
@@ -49,11 +49,10 @@ static const char *camera_tool_description(void *self)
     return "Capture one current camera frame as JPEG, optionally save it, and optionally return it as an image";
 }
 
-/*
- * 返回 JSON Schema 字符串，定义工具接受参数的类型和约束：
- * quality（JPEG 质量 1-100，默认70）、save_path（保存路径）、return_image（是否返回图像）。
- * 参数: self - 工具实例指针（未使用）
- * 返回: JSON Schema 字符串
+/**
+ * @brief 查询 JPEG 质量、保存路径及图像返回参数 Schema。
+ * @param[in] self 未使用实例借用，可 NULL。
+ * @return 常驻只读 JSON 借用，无分配，可并发。
  */
 static const char *camera_tool_schema_json(void *self)
 {
@@ -68,11 +67,11 @@ static const char *camera_tool_schema_json(void *self)
     "}";
 }
 
-/*
- * 从 JSON 值中解析布尔类型，支持布尔、数字和字符串 ("true"/"1"/"yes"/"on") 多种格式。
- * 参数: value - JSON 值，可为 NULL
- *       default_value - 解析失败或无值时的默认返回值
- * 返回: 解析出的布尔值
+/**
+ * @brief 兼容解析布尔、非零数值及 true/1/yes/on 字符串。
+ * @param[in] value 调用期 JSON 借用，可 NULL，其他字符串解析为 false。
+ * @param[in] default_value 缺失或非标量类型时的默认值。
+ * @return 按值布尔，无分配，无共享状态。
  */
 static bool json_bool_or_default(cc_json_value_t *value, bool default_value)
 {
@@ -95,12 +94,12 @@ static bool json_bool_or_default(cc_json_value_t *value, bool default_value)
            strcmp(text, "on") == 0;
 }
 
-/*
- * 安全复制字符串到固定大小缓冲区，超长则返回失败并置空。
- * 参数: dst - 目标缓冲区
- *       dst_size - 缓冲区容量（含终止符）
- *       value - 源字符串，可为 NULL（此时置空 dst）
- * 返回: true 成功，false 字符串过长或参数无效
+/**
+ * @brief 复制完整参数字符串到固定数组。
+ * @param[out] dst 独占输出数组借用，与源不重叠。
+ * @param[in] dst_size 包含 NUL 的容量。
+ * @param[in] value 调用期 NUL 借用，NULL 按空串。
+ * @return 复制成功 true，参数无效或超长 false，超长时有效输出清空，无分配。
  */
 static bool copy_arg_string(char *dst, size_t dst_size, const char *value)
 {
@@ -121,12 +120,12 @@ static bool copy_arg_string(char *dst, size_t dst_size, const char *value)
     return true;
 }
 
-/*
- * 将格式化错误消息写入工具调用结果，自动管理 out_result->error 内存。
- * 参数: out_result - 工具调用结果
- *       fmt - printf 风格格式串
- *       ... - 可变参数
- * 无返回值，内部处理内存分配失败时回退到固定错误文本。
+/**
+ * @brief 分配格式化摄像头诊断并交付空结果。
+ * @param[out] out_result 独占空错误槽借用，NULL 跳过，诊断由 cc_tool_result_cleanup 回收。
+ * @param[in] fmt 调用期 printf 格式借用，NULL 跳过。
+ * @param[in] ... 与格式匹配并覆盖两次格式化的参数借用。
+ * @post 格式化/分配失败尝试复制回退文本，OOM 时 error 可 NULL，调用者设置 ok。
  */
 static void camera_tool_set_errorf(cc_tool_result_t *out_result, const char *fmt, ...)
 {
@@ -159,14 +158,13 @@ static void camera_tool_set_errorf(cc_tool_result_t *out_result, const char *fmt
     out_result->error = text;
 }
 
-/*
- * 解析 JSON 参数字符串为 camera_tool_args_t 结构体，应用默认值（quality=70,
- * save_jpeg=true, return_image=true）并对 quality 做 1-100 钳位。
- * 参数: args_json - JSON 参数字符串，可为 NULL 或空（使用默认值）
- *       out_args - [出参] 解析结果
- *       error - 错误消息缓冲区
- *       error_size - 错误消息缓冲区大小
- * 返回: true 解析成功，false 失败（错误信息写入 error）
+/**
+ * @brief 解析采集参数并应用质量 70、保存与返回图像默认值。
+ * @param[in] args_json 调用期 NUL JSON 借用，NULL/空采用默认值。
+ * @param[out] out_args 必填独占结构借用，仅成功写入，质量小于 1 用 70，大于 100 用 100。
+ * @param[out] error 可选独占诊断数组借用，失败时容量允许则写入。
+ * @param[in] error_size 诊断数组容量。
+ * @return 成功 true，JSON/类型/路径过长失败 false，临时树始终释放，无拥有权转交。
  */
 static bool parse_camera_tool_args(const char *args_json,
                                    camera_tool_args_t *out_args,
@@ -251,14 +249,14 @@ static bool parse_camera_tool_args(const char *args_json,
     return true;
 }
 
-/*
- * 执行摄像头采集流程：解析参数 → 捕获 JPEG → 可选保存 → 按需生成 Base64 artifact。
- * 通过 app_profile_span 记录采集和保存的性能耗时。
- * 参数: self - 工具实例，持有借用的 filesystem port 视图
- *       args_json - JSON 参数字符串
- *       ctx - 单次工具调用上下文
- *       out_result - [出参] 工具调用结果（ok/error/text/artifacts）
- * 返回: 始终返回 CC_OK（错误信息写入 out_result）
+/**
+ * @brief 同步采集 JPEG、按需保存并交付 Base64 图像 artifact。
+ * @param[in] self 工具实例借用，覆盖调用期，保存时必须持有有效文件端口。
+ * @param[in] args_json 调用期 NUL JSON 借用，NULL/空用默认值。
+ * @param[in] ctx 调用期上下文借用，保存要求 workspace_dir。
+ * @param[out] out_result 必填独占空结果，拥有字段由 cc_tool_result_cleanup 回收。
+ * @return 输出 NULL 为参数错误，其余 CC_OK，失败见 ok/error，诊断 OOM 可 NULL。
+ * @note JPEG 与临时 artifact 在各路径清理，已写文件保留，底层摄像头及文件端口负责并发。
  */
 static cc_result_t camera_tool_call(
     void *self,
@@ -267,6 +265,10 @@ static cc_result_t camera_tool_call(
     cc_tool_result_t *out_result)
 {
     camera_tool_t *tool = (camera_tool_t *)self;
+
+    if (!out_result) {
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null camera tool result");
+    }
 
     memset(out_result, 0, sizeof(*out_result));
     cc_media_artifact_list_init(&out_result->artifacts);
@@ -353,6 +355,12 @@ static cc_result_t camera_tool_call(
         artifact.width = image.width;
         artifact.height = image.height;
 
+        if (!artifact.id || !artifact.mime || (args.save_jpeg && !artifact.path)) {
+            cc_media_artifact_cleanup(&artifact);
+            board_camera_jpeg_cleanup(&image);
+            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate camera artifact metadata");
+        }
+
         cc_result_t rc = cc_tool_result_add_artifact(out_result, &artifact);
         cc_media_artifact_cleanup(&artifact);
         if (rc.code != CC_OK) {
@@ -362,6 +370,7 @@ static cc_result_t camera_tool_call(
             board_camera_jpeg_cleanup(&image);
             return cc_result_ok();
         }
+        cc_result_free(&rc);
     }
 
     char text[220];
@@ -388,9 +397,10 @@ static cc_result_t camera_tool_call(
     return cc_result_ok();
 }
 
-/*
- * 释放 camera_tool_t 工具实例的内存。
- * 参数: self - 工具实例指针
+/**
+ * @brief 回收摄像头工具实例并结束文件端口借用。
+ * @param[in] self 转移拥有权的实例，可 NULL，调用者先等待进行中的调用完成。
+ * @post 实例失效，文件端口仍由创建方拥有。
  */
 static void camera_tool_destroy(void *self)
 {
@@ -405,11 +415,11 @@ static const cc_tool_vtable_t s_camera_tool_vtable = {
     camera_tool_destroy,
 };
 
-/*
- * 创建 camera_capture 工具实例，分配 camera_tool_t 结构体并挂载虚函数表。
- * 参数: ctx - 工具工厂上下文，必须提供 workspace root-scoped 二进制写入能力
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 成功，CC_ERR_INVALID_ARGUMENT 空输出指针，CC_ERR_OUT_OF_MEMORY 内存分配失败
+/**
+ * @brief 创建持有文件端口借用视图的采集工具。
+ * @param[in] ctx 工厂借用，要求 root-scoped 二进制写入，端口存活覆盖工具及其调用。
+ * @param[out] out_tool 必填独占空槽，校验通过后清空，成功用 vtable destroy 回收。
+ * @return CC_OK，参数/能力无效为参数错误，分配失败 OOM，诊断由 cc_result_free 回收。
  */
 cc_result_t camera_tool_create(const cc_runtime_tool_factory_ctx_t *ctx, cc_tool_t *out_tool)
 {

@@ -8,14 +8,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
-#define APP_LOG_HOOK_STACK_BUF 192U
+#define APP_LOG_HOOK_STACK_BUF 192U /**< ESP 日志首次格式化的栈缓冲字节数，包含 NUL。 */
 
-/*
- * 跳过 ANSI 转义序列（\033[...m 格式），返回实际内容起始位置的指针。
- * 用于剥离 ESP-IDF 日志输出中的颜色控制码。
- *
- * 参数: text - 原始日志行指针
- * 返回: 跳过转义序列后的文本起始指针
+/**
+ * @brief 跳过日志起始处连续的 ANSI CSI 控制序列。
+ * @param[in] text 稳定 NUL 文本借用，允许 NULL。
+ * @return 原串中的首个正文位置，NULL 仍为 NULL，不复制、不修改、不删除正文中间的控制序列。
+ * @note CSI 以 ESC 加左方括号开始，扫描到首个 0x40 至 0x7e 终结字节，残缺序列停在原结尾。
  */
 static const char *skip_ansi_escape_sequences(const char *text)
 {
@@ -28,12 +27,10 @@ static const char *skip_ansi_escape_sequences(const char *text)
     return p;
 }
 
-/*
- * 根据 ESP-IDF 日志行的首字母（E/W/I/D/V）推断日志级别，
- * 在跳过 ANSI 转义和前置空白后识别。
- *
- * 参数: line - 日志行指针
- * 返回: 对应的 cc_log_level_t 级别
+/**
+ * @brief 跳过起始 CR/LF 和 ANSI CSI 后按首字母推断 ESP 日志级别。
+ * @param[in] line 调用期稳定 NUL 日志借用，允许 NULL，不按任意空白归一。
+ * @return E/W/I/D/V 分别映射 ERROR/WARN/INFO/DEBUG/TRACE，空值或其他前缀使用 INFO。
  */
 static cc_log_level_t esp_line_level(const char *line)
 {
@@ -51,13 +48,11 @@ static cc_log_level_t esp_line_level(const char *line)
     }
 }
 
-/*
- * 判断 ESP-IDF 日志行是否包含指定的标签名称（位于 ")" 和 ":" 之间）。
- * 在 ANSI 转义跳过之后进行匹配。
- *
- * 参数: line - 日志行指针
- * 参数: tag  - 标签名称
- * 返回: true 表示标签匹配
+/**
+ * @brief 在首个时间戳右括号后查找精确标签与紧随的冒号。
+ * @param[in] line 稳定 NUL 行借用，NULL 不匹配。
+ * @param[in] tag 稳定 NUL 标签借用，NULL 不匹配。
+ * @return 跳过起始 CSI、右括号后 ASCII 空格并精确匹配为 true，格式不符为 false。
  */
 static bool line_has_tag(const char *line, const char *tag)
 {
@@ -71,13 +66,11 @@ static bool line_has_tag(const char *line, const char *tag)
     return strncmp(p, tag, tag_len) == 0 && p[tag_len] == ':';
 }
 
-/*
- * 提取日志行中指定标签对应的负载（payload），即 "tag: " 之后的内容。
- * 返回负载起始位置的指针，若标签不匹配或不存在则返回 NULL。
- *
- * 参数: line - 日志行指针
- * 参数: tag  - 标签名称
- * 返回: 负载内容起始指针，失败返回 NULL
+/**
+ * @brief 按同一时间戳和标签规则借出冒号后正文。
+ * @param[in] line 稳定 NUL 行借用，NULL 返回 NULL。
+ * @param[in] tag 精确标签借用，NULL 返回 NULL。
+ * @return 匹配时返回跳过冒号后 ASCII 空格的原串视图，空正文可指向结尾，未匹配为 NULL。
  */
 static const char *line_tag_payload(const char *line, const char *tag)
 {
@@ -94,13 +87,12 @@ static const char *line_tag_payload(const char *line, const char *tag)
     return p;
 }
 
-/*
- * 判断日志行的标签是否匹配给定标签集合中的任意一个。
- *
- * 参数: line      - 日志行指针
- * 参数: tags      - 标签字符串数组指针
- * 参数: tag_count - 标签数组长度
- * 返回: true 表示匹配到至少一个标签
+/**
+ * @brief 顺序核对固定标签表，遇到首个匹配即结束。
+ * @param[in] line 调用期 NUL 日志借用，允许 NULL。
+ * @param[in] tags 含 tag_count 项的稳定借用数组，零项时可为 NULL，空元素沿单标签不匹配处理。
+ * @param[in] tag_count 数组元素数量。
+ * @return 至少一个精确标签命中为 true，其他为 false，不保存输入视图。
  */
 static bool line_has_any_tag(const char *line, const char *const *tags, size_t tag_count)
 {
@@ -112,14 +104,12 @@ static bool line_has_any_tag(const char *line, const char *const *tags, size_t t
     return false;
 }
 
-/*
- * 根据日志级别和内容判断是否应丢弃该日志行，用于过滤 ESP-IDF 中大量
- * 重复的、无意义的底层日志（如 USB、SD卡、WiFi、LVGL 驱动等）。
- * 维护模式或路径特定的噪声日志都会被剔除。
- *
- * 参数: level - 日志级别
- * 参数: line  - 日志行内容
- * 返回: true 表示该行应被丢弃，false 表示保留
+/**
+ * @brief 按固定文本和标签规则抑制已知的驱动重复日志。
+ * @param[in] level 本次推断的 SDK 级别，指定噪声标签只过滤 INFO 及以下。
+ * @param[in] line 稳定 NUL 日志借用，空串丢弃，NULL 返回 false。
+ * @return 命中任一固定规则为 true，其他为 false，不读取总线可变状态。
+ * @note 此过滤与事件总线的维护模式、路由、脱敏和输出级别各自执行。
  */
 static bool app_log_should_drop(cc_log_level_t level, const char *line)
 {
@@ -230,14 +220,13 @@ static bool app_log_should_drop(cc_log_level_t level, const char *line)
     return false;
 }
 
-/*
- * 注册到 ESP-IDF 的 vprintf 钩子：拦截所有 ESP_LOG* 输出，
- * 去除行尾换行回车，跳过空行，过滤噪声日志，将保留的日志发布为事件。
- * 优先使用栈缓冲区，超长时回退到堆分配。
- *
- * 参数: fmt - printf 格式字符串
- * 参数: ap  - 可变参数列表
- * 返回: 格式化后的字符数
+/**
+ * @brief 同步格式化 ESP 日志片段，去除尾部 CR/LF、过滤后转交事件发布入口。
+ * @param[in] fmt 调用期有效的 printf 格式借用，NULL 返回零。
+ * @param[in] ap 与格式匹配的可变参数借用，每次格式化都用 va_copy，不消费原游标。
+ * @return 首次格式化的预期字符数，过滤和有界截断仍保留该值，任一次格式化失败返回对应负值。
+ * @note 短片段使用栈缓冲，长片段最多申请 APP_EVENT_TEXT_MAX 加一字节，PSRAM 失败再试内部 RAM，两者失败保留栈截断。
+ * 回调不借用可销毁的总线字段，发布入口自行取得资源租约，关闭后迟到的静态回调不能接触已释放原语。
  */
 static int app_log_vprintf(const char *fmt, va_list ap)
 {
@@ -253,6 +242,7 @@ static int app_log_vprintf(const char *fmt, va_list ap)
     va_end(copy);
 
     if (n > 0) {
+        size_t len = (size_t)n < sizeof(stack) ? (size_t)n : sizeof(stack) - 1;
         if ((size_t)n >= sizeof(stack)) {
             size_t heap_len = (size_t)n;
             if (heap_len > APP_EVENT_TEXT_MAX) {
@@ -264,14 +254,22 @@ static int app_log_vprintf(const char *fmt, va_list ap)
             }
             if (heap) {
                 va_copy(copy, ap);
-                vsnprintf(heap, heap_len + 1, fmt, copy);
+                int written = vsnprintf(heap, heap_len + 1, fmt, copy);
                 va_end(copy);
+                if (written < 0) {
+                    heap_caps_free(heap);
+                    return written;
+                }
+                len = (size_t)written < heap_len ? (size_t)written : heap_len;
+                heap[len] = '\0';
                 line = heap;
             } else {
                 stack[sizeof(stack) - 1] = '\0';
             }
         }
-        size_t len = strlen(line);
+        /* 已初始化范围内的首个 NUL 沿既有 C 文本语义结束正文。 */
+        const char *terminator = memchr(line, '\0', len);
+        if (terminator) len = (size_t)(terminator - line);
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
         }
@@ -288,15 +286,14 @@ static int app_log_vprintf(const char *fmt, va_list ap)
     return n;
 }
 
-/*
- * cc_logger 的自定义 sink 回调：将应用层 SDK 日志转换为 APP_EVENT_KIND_LOG 事件发布。
- * user_data 和 logger_name 参数当前未使用。
- *
- * 参数: user_data   - 用户数据（未使用）
- * 参数: level       - 日志级别
- * 参数: logger_name - 日志器名称（未使用）
- * 参数: message     - 日志消息内容
- * 返回: 无
+/**
+ * @brief 将 SDK 日志同步转为 runtime 来源的日志事件。
+ * @param[in,out] user_data 注册为 NULL，当前忽略，不保管外部上下文。
+ * @param[in] level 原样交事件层的级别值。
+ * @param[in] logger_name 调用期名称借用，当前忽略。
+ * @param[in] message 调用期 NUL 正文借用，NULL 按空串，跨调用保存由事件层复制。
+ * @post 已向公共发布入口提交一次，路由、脱敏和关闭门禁沿总线契约，输入不被接管。
+ * @note SDK 在释放 sink 注册锁后调用该静态函数，替换 sink 不等待已经取得快照的回调。
  */
 static void sdk_logger_sink(void *user_data,
                             cc_log_level_t level,
@@ -308,15 +305,16 @@ static void sdk_logger_sink(void *user_data,
     app_event_publish(APP_EVENT_KIND_LOG, APP_EVENT_SOURCE_RUNTIME, level, message ? message : "");
 }
 
-/*
- * 根据当前事件总线的配置（串口调试开关、USB日志级别、维护模式）动态调整
- * ESP-IDF 所有模块的日志级别。维护模式下大量模块被设为 WARN 以抑制噪声。
- *
- * 参数: 无
- * 返回: 无
+/**
+ * @brief 在同一总线状态锁内读取当前配置并顺序设置整批 ESP 日志阈值。
+ * @pre 调用者持总线资源租约或生命周期独占，状态锁存活，当前 native setter 不记录日志或调用用户回调。
+ * @post wildcard 与各固定标签已按锁内最新状态依次调用 setter，旧配置快照不能在解锁后覆盖新状态。
+ * @note 当前 IDF setter 只取得独立日志级别锁并更新表，日志路径释放该锁后才进入本组件回调。
+ * native void setter 不报告内部标签分配失败，本函数不宣称各标签更新均已确认成功。
  */
 void app_event_log_hooks_apply_esp_level(void)
 {
+    app_event_bus_lock();
     if (g_app_event_bus.maintenance_mode) {
         esp_log_level_set("*", ESP_LOG_WARN);
         esp_log_level_set("ota_manager", ESP_LOG_INFO);
@@ -367,6 +365,7 @@ void app_event_log_hooks_apply_esp_level(void)
         esp_log_level_set("USB_MSC_SCSI", ESP_LOG_WARN);
         esp_log_level_set("esp_lvgl:adapter", ESP_LOG_WARN);
         esp_log_level_set("esp_lvgl:touch", ESP_LOG_WARN);
+        app_event_bus_unlock();
         return;
     }
 
@@ -428,29 +427,40 @@ void app_event_log_hooks_apply_esp_level(void)
     esp_log_level_set("USB_MSC_SCSI", ESP_LOG_WARN);
     esp_log_level_set("esp_lvgl:adapter", ESP_LOG_WARN);
     esp_log_level_set("esp_lvgl:touch", ESP_LOG_WARN);
+    app_event_bus_unlock();
 }
 
-/*
- * 安装 ESP-IDF 和 SDK 日志钩子：将 app_log_vprintf 注册为 ESP 的 vprintf 钩子，
- * 将 sdk_logger_sink 注册为 cc_logger 的 sink。已安装时跳过重复注册。
- *
- * 参数: 无
- * 返回: 无
+/**
+ * @brief 在总线状态锁内安装全局 ESP hook 并重新发布 SDK sink 配对。
+ * @pre 调用者持总线租约或初始化独占，原语存活，本组件是这两个进程期日志入口的配置 owner。
+ * @post ESP hook 安装标志与注册保持同锁顺序，SDK sink 设置已尝试，重复调用继续尝试 SDK 注册。
+ * @note native ESP 注册为原子指针交换，SDK setter 不在注册锁内调用 sink，安装过程不递归发布事件。
+ * SDK void setter 创建注册锁失败时保留原 sink，此失败不由 vprintf_installed 表示。
  */
 void app_event_log_hooks_install(void)
 {
+    app_event_bus_lock();
     if (!g_app_event_bus.vprintf_installed) {
         (void)esp_log_set_vprintf(app_log_vprintf);
         g_app_event_bus.vprintf_installed = true;
     }
     cc_logger_set_sink(sdk_logger_sink, NULL);
+    app_event_bus_unlock();
 }
 
+/**
+ * @brief 在状态锁内恢复 SDK 默认 stderr 与 ESP 默认 vprintf，并清除 ESP 安装标志。
+ * @pre 生命周期 owner 已关闭总线入口并排空已接纳资源租约，状态锁尚未销毁，禁止并发重新 install。
+ * @post 后续日志读取默认入口，已取得旧函数快照的静态回调仍可结束，公共发布门已关闭且不会再取得动态总线资源。
+ * @note 不接管先前第三方 hook，也不恢复其他组件注册，本项目统一拥有该全局日志接线。
+ */
 void app_event_log_hooks_uninstall(void)
 {
+    app_event_bus_lock();
     cc_logger_set_sink(NULL, NULL);
     if (g_app_event_bus.vprintf_installed) {
         (void)esp_log_set_vprintf(vprintf);
         g_app_event_bus.vprintf_installed = false;
     }
+    app_event_bus_unlock();
 }

@@ -13,6 +13,7 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "nvs.h"
+#include "cc/ports/cc_thread.h"
 
 typedef struct {
     ota_manager_state_t state;
@@ -50,9 +51,25 @@ typedef struct {
 static const char *TAG = "ota_manager";
 static const char *OTA_META_NAMESPACE = "ota_meta";
 static ota_manager_ctx_t s_ota;
+static cc_mutex_t s_ota_manager_mutex;
 
-/*
- * 格式化错误信息并设置状态为 ERROR。支持 printf 风格格式化。
+/** @brief 并发安装进程期锁并串行访问管理器上下文和一次原生 OTA 操作。
+ * @return 成功持锁为 true，创建失败为 false，拥有诊断在本层释放。
+ * @note 锁持续到进程结束，持锁期间不调用 service、HTTP 或应用回调。
+ */
+static bool ota_manager_lock(void)
+{
+    cc_result_t rc = cc_mutex_init_once(&s_ota_manager_mutex);
+    bool ready = rc.code == CC_OK;
+    cc_result_free(&rc);
+    if (ready) cc_mutex_lock(s_ota_manager_mutex);
+    return ready;
+}
+
+/** @brief 在管理器锁内保存截断诊断并转为 ERROR。
+ * @param[in] fmt 必填 printf 格式借用，覆盖格式化调用。
+ * @param[in] ... 对应参数，字符串保持到本次调用返回。
+ * @post 最多保留 127 字节正文，原生更新句柄仍归本事务持有供 cancel。
  */
 static void set_error(const char *fmt, ...)
 {
@@ -64,9 +81,9 @@ static void set_error(const char *fmt, ...)
     ESP_LOGE(TAG, "%s", s_ota.error);
 }
 
-/*
- * 将 esp_ota_img_states_t 枚举转换为可读字符串。
- * 返回: "new"/"pending_verify"/"valid"/"invalid"/"aborted"/"undefined"/"unknown"
+/** @brief 将原生镜像状态映射为只读诊断文本。
+ * @param[in] state 原生枚举，未知数值也可传入。
+ * @return 进程期常量借用，未知值为 unknown，无释放责任。
  */
 static const char *ota_image_state_string(esp_ota_img_states_t state)
 {
@@ -81,8 +98,11 @@ static const char *ota_image_state_string(esp_ota_img_states_t state)
     }
 }
 
-/*
- * 安全复制分区标签到输出缓冲区。
+/** @brief 按目标容量复制原生分区标签。
+ * @param[out] dst 可空槽，非空且容量非零时保持 NUL 终止。
+ * @param[in] dst_size 输出字节容量，含 NUL，零时无写入。
+ * @param[in] partition 可空进程期分区借用，NULL 交付空串。
+ * @post 超长标签截断，不转移分区拥有权。
  */
 static void copy_label(char *dst, size_t dst_size, const esp_partition_t *partition)
 {
@@ -92,8 +112,11 @@ static void copy_label(char *dst, size_t dst_size, const esp_partition_t *partit
     snprintf(dst, dst_size, "%s", partition ? partition->label : "");
 }
 
-/*
- * 安全复制 app_desc 字段（自动截断到 src_size，确保 \0 结尾）。
+/** @brief 从定长原生描述字段复制终止文本，避免越界扫描。
+ * @param[out] dst 可空输出，容量非零时有效槽写 NUL。
+ * @param[in] dst_size 目标字节容量，含 NUL，零时跳过。
+ * @param[in] src 可空 src_size 字节稳定借用，NULL 按空串。
+ * @param[in] src_size 源最大可读字节数，源无 NUL 时按此界限截断。
  */
 static void copy_desc_field(char *dst, size_t dst_size, const char *src, size_t src_size)
 {
@@ -108,8 +131,9 @@ static void copy_desc_field(char *dst, size_t dst_size, const char *src, size_t 
     dst[n] = '\0';
 }
 
-/*
- * 复制并净化上传文件名（替换控制字符和路径分隔符为 _）。
+/** @brief 在管理器锁内复制上传显示名并净化控制字节和路径分隔符。
+ * @param[in] name 可空 NUL 文本借用，最多保存 95 字节，NULL 清空。
+ * @post 内部名称独立保存，不打开文件，不借用原字符串。
  */
 static void copy_upload_name(const char *name)
 {
@@ -130,8 +154,11 @@ static void copy_upload_name(const char *name)
     s_ota.upload_name[out] = '\0';
 }
 
-/*
- * 过滤浏览器上传时间字符串，只保留 ISO8601 安全字符。
+/** @brief 复制允许字符组成的浏览器时间显示文本。
+ * @param[out] dst 可空输出，非空容量非零时先清空。
+ * @param[in] dst_size 输出字节容量，含 NUL，零时跳过。
+ * @param[in] time_text 可空同步 NUL 文本借用，NULL 按空串。
+ * @post 只保留数字、字母及允许标点并按容量截断，此过滤不验证日历语义。
  */
 static void copy_browser_time(char *dst, size_t dst_size, const char *time_text)
 {
@@ -156,8 +183,10 @@ static void copy_browser_time(char *dst, size_t dst_size, const char *time_text)
     dst[out] = '\0';
 }
 
-/*
- * 将 SHA256 字节数组转换为十六进制字符串。
+/** @brief 将三十二字节 SHA-256 值格式化为小写十六进制。
+ * @param[out] dst 至少 65 字节输出槽，可 NULL，此时跳过。
+ * @param[in] dst_size 输出容量，低于 65 时保持输出。
+ * @param[in] sha 可空三十二字节稳定借用，NULL 时跳过。
  */
 static void sha256_to_hex(char *dst, size_t dst_size, const uint8_t *sha)
 {
@@ -172,8 +201,11 @@ static void sha256_to_hex(char *dst, size_t dst_size, const uint8_t *sha)
     dst[64] = '\0';
 }
 
-/*
- * 从 NVS 读取指定分区的 uploaded_at 时间戳。
+/** @brief 打开本次 NVS 句柄读取分区上传时间并立即关闭。
+ * @param[in] partition 必填进程期分区借用，标签不能为空。
+ * @param[out] dst 必填可写缓冲，参数有效时先清空，读取失败恢复空串。
+ * @param[in] dst_size 字节容量，含 NUL，零为 INVALID_ARG。
+ * @return 原生 open/get_str 结果或 INVALID_ARG，所有已打开句柄均关闭。
  */
 static esp_err_t read_partition_uploaded_at(const esp_partition_t *partition, char *dst, size_t dst_size)
 {
@@ -199,8 +231,11 @@ static esp_err_t read_partition_uploaded_at(const esp_partition_t *partition, ch
     return err;
 }
 
-/*
- * 将 uploaded_at 时间戳写入 NVS（以分区标签名作为 key）。
+/** @brief 使用分区标签写入并提交 uploaded_at 元数据。
+ * @param[in] partition 必填分区借用，标签非空。
+ * @param[in] uploaded_at 必填非空 NUL 文本借用，覆盖 set_str 返回。
+ * @return 原生 open/set/commit 首错或 INVALID_ARG，已打开句柄总会关闭。
+ * @note NVS commit 错误按原生持久化状态解释，镜像和 boot 选择由上层另行核对。
  */
 static esp_err_t write_partition_uploaded_at(const esp_partition_t *partition, const char *uploaded_at)
 {
@@ -221,8 +256,19 @@ static esp_err_t write_partition_uploaded_at(const esp_partition_t *partition, c
     return err;
 }
 
-/*
- * 读取分区 app_desc 信息（项目名/版本/SHA256/上传时间）并填充输出字段。
+/** @brief 尽力读取一份分区描述和 NVS 显示元数据。
+ * @param[in] partition 可空进程期借用，NULL 只交付空字段。
+ * @param[out] label 可空标签槽，按 label_size 截断终止。
+ * @param[in] label_size 标签槽字节容量，零时跳过。
+ * @param[out] app_name 可空应用名槽，描述读取失败为空。
+ * @param[in] app_name_size 应用名槽字节容量，含 NUL。
+ * @param[out] version 可空版本槽，描述读取失败为空。
+ * @param[in] version_size 版本槽字节容量，含 NUL。
+ * @param[out] sha256 可空十六进制槽，容量至少 65 时格式化 app_elf_sha256。
+ * @param[in] sha256_size 摘要槽字节容量，含 NUL。
+ * @param[out] uploaded_at 可空上传时间槽，NVS 失败为空。
+ * @param[in] uploaded_at_size 时间槽字节容量，含 NUL。
+ * @note 此摘要来自 app_desc 的 ELF 字段，上传整份 BIN 的摘要由 service 单独验证。
  */
 static void read_partition_info(const esp_partition_t *partition,
                                 char *label,
@@ -254,8 +300,8 @@ static void read_partition_info(const esp_partition_t *partition,
     (void)read_partition_uploaded_at(partition, uploaded_at, uploaded_at_size);
 }
 
-/*
- * 刷新 running/boot/target 分区元数据（标签、版本、SHA256 等）。
+/** @brief 在管理器锁内刷新运行、启动和目标分区元数据。
+ * @post 原生回滚状态未知时交付 unknown 和 rollback_pending=false，读取失败字段保持空。
  */
 static void refresh_partition_status(void)
 {
@@ -312,16 +358,17 @@ static void refresh_partition_status(void)
     }
 }
 
-/*
- * 更新分区状态信息：读取 running/boot/target 分区标签等。
+/** @brief 在已有管理器锁持有内转调分区元数据刷新。
+ * @pre 外层公开包装持有进程期 mutex，本 helper 不再次取得该锁。
  */
-void ota_manager_refresh_status(void)
+static void ota_manager_refresh_status_locked(void)
 {
     refresh_partition_status();
 }
 
-/*
- * 将 ota_image_state 枚举转换为可读字符串。
+/** @brief 将管理器 RAM 事务状态映射为只读文本。
+ * @param[in] state 任意枚举值。
+ * @return 进程期常量借用，未知值为 unknown。
  */
 const char *ota_manager_state_string(ota_manager_state_t state)
 {
@@ -334,18 +381,19 @@ const char *ota_manager_state_string(ota_manager_state_t state)
     }
 }
 
-/*
- * 获取上次错误描述，无错误时返回 "none"。
+/** @brief 在管理器锁内选择内部错误文本或常量 none。
+ * @return 内部或进程期文本借用，调用者保留期间排除错误更新和 cancel。
  */
-const char *ota_manager_last_error(void)
+static const char *ota_manager_last_error_locked(void)
 {
     return s_ota.error[0] ? s_ota.error : "none";
 }
 
-/*
- * 更新正在运行的分区信息：调用 esp_ota_get_running_partition。
+/** @brief 在管理器锁内调用原生 VALID 确认并刷新回滚诊断。
+ * @return 原生确认结果，失败保留原生 otadata 状态供外层解释。
+ * @pre service 已建立 flash 敏感操作的离线窗口。
  */
-void ota_manager_mark_app_valid(void)
+static esp_err_t ota_manager_mark_app_valid_locked(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
@@ -360,20 +408,19 @@ void ota_manager_mark_app_valid(void)
         ESP_LOGW(TAG, "mark app valid returned: %s", esp_err_to_name(err));
     }
     refresh_partition_status();
+    return err;
 }
 
-/*
- * 准备 OTA 升级：重置内部状态，校验升级分区与固件大小，复制上传元数据（文件名、浏览器时间），
- * 进入 UPLOADING 状态并刷新分区状态。
- * 参数: expected_size - 预期固件总字节数
- *       upload_name  - 上传固件的文件名字符串
- *       browser_time - 浏览器端时间戳字符串（可为 NULL）
- * 返回: ESP_OK 成功 / ESP_ERR_INVALID_STATE 已有升级进行中 /
- *       ESP_ERR_NOT_FOUND 无可用升级分区 / ESP_ERR_INVALID_SIZE 固件大小超出目标分区
+/** @brief 在管理器锁内选择目标并建立无原生句柄的上传事务。
+ * @param[in] expected_size 非零镜像字节数，须不超过目标容量。
+ * @param[in] upload_name 可空稳定 NUL 名称借用，内部净化复制。
+ * @param[in] browser_time 可空稳定 NUL 时间借用，内部过滤复制。
+ * @return 成功、状态错误、无目标或大小错误，失败可更新 ERROR 诊断。
+ * @post UPLOADING 或尚存原生句柄时保留旧事务，其余情况重置 RAM 元数据。
  */
-esp_err_t ota_manager_begin(size_t expected_size, const char *upload_name, const char *browser_time)
+static esp_err_t ota_manager_begin_locked(size_t expected_size, const char *upload_name, const char *browser_time)
 {
-    if (s_ota.state == OTA_MANAGER_UPLOADING && s_ota.target) {
+    if (s_ota.update_handle_open || s_ota.state == OTA_MANAGER_UPLOADING) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -419,25 +466,24 @@ esp_err_t ota_manager_begin(size_t expected_size, const char *upload_name, const
     return ESP_OK;
 }
 
-/*
- * 写入 OTA 固件数据块：首包校验镜像头魔数，首次写入时打开 OTA 句柄（esp_ota_begin），
- * 逐块写入目标分区并跟踪进度，每 256KB 报告一次进度百分比。
- * 参数: data - 固件数据缓冲区指针
- *       len  - 本次写入字节数
- * 返回: ESP_OK 成功 / ESP_ERR_INVALID_STATE 状态不正确或 data 为空 /
- *       ESP_ERR_INVALID_SIZE 写入量超出声明大小 / ESP_ERR_OTA_VALIDATE_FAILED 镜像头魔数无效 /
- *       其他 ESP-IDF OTA 写入错误码
+/** @brief 在管理器锁内验证一块容量并同步交给原生 OTA writer。
+ * @param[in] data 必填 len 字节借用，覆盖 esp_ota_write 返回。
+ * @param[in] len 本块字节数，零时直接成功。
+ * @return 状态/大小/魔数或原生错误，错误转 ERROR 并保留尚存句柄供 cancel。
+ * @post 成功累计真实写入量，首个非空块先检查魔数再创建原生句柄。
  */
-esp_err_t ota_manager_write(const void *data, size_t len)
+static esp_err_t ota_manager_write_locked(const void *data, size_t len)
 {
     if (s_ota.state != OTA_MANAGER_UPLOADING || !s_ota.target || !data) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (s_ota.bytes_written + len > s_ota.expected_size) {
+    if (s_ota.bytes_written > s_ota.expected_size ||
+        len > s_ota.expected_size - s_ota.bytes_written) {
         set_error("OTA upload exceeds declared size");
         return ESP_ERR_INVALID_SIZE;
     }
-    if (!s_ota.image_header_checked && len > 0) {
+    if (len == 0) return ESP_OK;
+    if (!s_ota.image_header_checked) {
         s_ota.image_header_checked = true;
         if (((const uint8_t *)data)[0] != ESP_IMAGE_HEADER_MAGIC) {
             set_error("OTA image has invalid magic byte: 0x%02x", ((const uint8_t *)data)[0]);
@@ -479,29 +525,25 @@ esp_err_t ota_manager_write(const void *data, size_t len)
     s_ota.bytes_written += len;
     if (s_ota.bytes_written >= s_ota.next_report_bytes || s_ota.bytes_written == s_ota.expected_size) {
         unsigned pct = s_ota.expected_size ?
-            (unsigned)((s_ota.bytes_written * 100U) / s_ota.expected_size) : 0;
+            (unsigned)(((uint64_t)s_ota.bytes_written * 100U) / s_ota.expected_size) : 0;
         ESP_LOGI(TAG,
                  "OTA upload progress %u/%u bytes (%u%%)",
                  (unsigned)s_ota.bytes_written,
                  (unsigned)s_ota.expected_size,
                  pct);
-        while (s_ota.next_report_bytes <= s_ota.bytes_written) {
+        while (s_ota.next_report_bytes <= s_ota.bytes_written &&
+               s_ota.next_report_bytes <= SIZE_MAX - 256U * 1024U) {
             s_ota.next_report_bytes += 256 * 1024;
         }
     }
     return ESP_OK;
 }
 
-/*
- * 完成 OTA 升级：校验写入字节数与预期一致，关闭 OTA 写入句柄（esp_ota_end），
- * 将目标分区设为下次启动分区（esp_ota_set_boot_partition），写入上传时间元数据（如有），
- * 进入 PENDING_REBOOT 状态等待用户重启。
- * 参数: 无
- * 返回: ESP_OK 成功 / ESP_ERR_INVALID_STATE 状态不正确 /
- *       ESP_ERR_INVALID_SIZE 写入量与预期不符（固件截断） /
- *       其他 ESP-IDF OTA 完成或分区设置错误码
+/** @brief 在管理器锁内消费原生 writer 并提交下次启动分区。
+ * @return 字节不齐为 INVALID_SIZE，其他失败保留原生结果，成功为 PENDING_REBOOT。
+ * @post end 返回后句柄即失效，boot 提交失败保留已写镜像，时间元数据失败仅日志记录。
  */
-esp_err_t ota_manager_finish(void)
+static esp_err_t ota_manager_finish_locked(void)
 {
     if (s_ota.state != OTA_MANAGER_UPLOADING || !s_ota.target || !s_ota.update_handle_open) {
         return ESP_ERR_INVALID_STATE;
@@ -513,11 +555,7 @@ esp_err_t ota_manager_finish(void)
         return ESP_ERR_INVALID_SIZE;
     }
 
-    /*
-     * esp_ota_end performs the ESP image validation. With Secure Boot enabled,
-     * ESP-IDF also verifies the appended image signature here and returns
-     * ESP_ERR_OTA_VALIDATE_FAILED before the boot partition can be selected.
-     */
+    /* 原生 end 校验镜像，启用 Secure Boot 时还校验签名，失败先于 boot 选择。 */
     esp_err_t err = esp_ota_end(s_ota.update_handle);
     s_ota.update_handle = 0;
     s_ota.update_handle_open = false;
@@ -547,10 +585,10 @@ esp_err_t ota_manager_finish(void)
     return ESP_OK;
 }
 
-/*
- * 取消当前 OTA：abort 句柄，重置状态。
+/** @brief 在管理器锁内消费尚存 writer 并清空 RAM 事务。
+ * @post 原生 abort 的 NOT_FOUND 表示句柄已不存在，已写 flash 和 boot 选择继续保留。
  */
-void ota_manager_cancel(void)
+static void ota_manager_cancel_locked(void)
 {
     if (s_ota.update_handle_open) {
         (void)esp_ota_abort(s_ota.update_handle);
@@ -560,8 +598,9 @@ void ota_manager_cancel(void)
     refresh_partition_status();
 }
 
-/*
- * 以指定标签查找 APP 类型分区。
+/** @brief 枚举 APP 分区并按标签寻找原生描述对象。
+ * @param[in] label 可空 NUL 借用，空串直接返回 NULL。
+ * @return 原生分区表的进程期借用或 NULL，迭代器本次释放。
  */
 static const esp_partition_t *find_app_partition_by_label(const char *label)
 {
@@ -586,12 +625,13 @@ static const esp_partition_t *find_app_partition_by_label(const char *label)
     return found;
 }
 
-/*
- * 设置启动分区为 label 指定的分区。
+/** @brief 在管理器锁内写 boot 选择并更新 RAM 状态。
+ * @param[in] label 可空 NUL 标签借用，空或未知为 NOT_FOUND。
+ * @return 活动事务为 INVALID_STATE，其余原生结果，成功按是否运行分区选择 IDLE/PENDING_REBOOT。
  */
-esp_err_t ota_manager_set_boot_partition(const char *label)
+static esp_err_t ota_manager_set_boot_partition_locked(const char *label)
 {
-    if (s_ota.state == OTA_MANAGER_UPLOADING) {
+    if (s_ota.update_handle_open || s_ota.state == OTA_MANAGER_UPLOADING) {
         return ESP_ERR_INVALID_STATE;
     }
     const esp_partition_t *partition = find_app_partition_by_label(label);
@@ -629,8 +669,11 @@ esp_err_t ota_manager_set_boot_partition(const char *label)
     return ESP_OK;
 }
 
-/*
- * 获取下一个 OTA 更新分区的信息（大小和标签）。
+/** @brief 尽力取得原生下一个更新分区的容量和标签。
+ * @param[out] out_size 可空字节数槽，无目标写零。
+ * @param[out] out_label 可空标签槽，容量非零时终止，必要时截断。
+ * @param[in] label_size 标签槽字节容量，含 NUL，零时跳过。
+ * @return 成功或 NOT_FOUND，不改变管理器事务，输出为独立值。
  */
 esp_err_t ota_manager_get_next_update_partition_info(size_t *out_size, char *out_label, size_t label_size)
 {
@@ -653,8 +696,11 @@ esp_err_t ota_manager_get_next_update_partition_info(size_t *out_size, char *out
     return ESP_OK;
 }
 
-/*
- * 枚举所有 APP 分区并填充信息数组。
+/** @brief 枚举全部 APP 分区，按容量填充独立值记录。
+ * @param[out] out_partitions 可空数组，NULL 时只统计总数。
+ * @param[in] max_partitions 可写元素个数，零时不填写。
+ * @return 实际分区总数，可能超过容量，已填条目数为二者较小值。
+ * @note 标签/描述/NVS 读取失败字段为空，运行及 boot 身份分别取样，不构成跨分区事务快照。
  */
 size_t ota_manager_get_partitions(ota_manager_partition_info_t *out_partitions, size_t max_partitions)
 {
@@ -696,18 +742,18 @@ size_t ota_manager_get_partitions(ota_manager_partition_info_t *out_partitions, 
     return count;
 }
 
-/*
- * 通过 esp_restart() 重启设备。
+/** @brief 调用原生 esp_restart 触发设备复位。
+ * @pre lifecycle owner 已执行所需关闭屏障，正常调用不返回。
  */
 void ota_manager_reboot(void)
 {
     esp_restart();
 }
 
-/*
- * 填充 status 结构体包含 OTA 状态和各分区元数据。
+/** @brief 在外层管理器锁内复制 RAM 事务及已缓存分区字段。
+ * @param[out] out_status 可空独占输出，非空清零并填充，所有文本按值保存。
  */
-void ota_manager_get_status(ota_manager_status_t *out_status)
+static void ota_manager_get_status_locked(ota_manager_status_t *out_status)
 {
     if (!out_status) {
         return;
@@ -736,4 +782,119 @@ void ota_manager_get_status(ota_manager_status_t *out_status)
     snprintf(out_status->boot_sha256, sizeof(out_status->boot_sha256), "%s", s_ota.boot_sha256);
     snprintf(out_status->boot_uploaded_at, sizeof(out_status->boot_uploaded_at), "%s", s_ota.boot_uploaded_at);
     out_status->rollback_pending = s_ota.rollback_pending;
+}
+
+/** @brief 在进程期锁内刷新 running、boot 和当前 target 的独立元数据。
+ * @post 原生读取失败的字段为空或 unknown，锁创建失败时保持上次快照。
+ */
+void ota_manager_refresh_status(void)
+{
+    if (!ota_manager_lock()) return;
+    ota_manager_refresh_status_locked();
+    cc_mutex_unlock(s_ota_manager_mutex);
+}
+
+/** @brief 借回最近错误文本或进程期常量 none。
+ * @return 借用字符串，锁创建失败返回常量说明，调用者不释放。
+ * @pre 保留内部文本期间由外层 owner 排除 begin、cancel 和其他错误更新。
+ */
+const char *ota_manager_last_error(void)
+{
+    if (!ota_manager_lock()) return "OTA manager lock unavailable";
+    const char *error = ota_manager_last_error_locked();
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return error;
+}
+
+/** @brief 串行确认运行镜像为 VALID，并刷新实际回滚状态。
+ * @return 原生确认结果或 NO_MEM，持久提交成功后的恢复由 service 负责。
+ * @pre 外层已关闭相机、交互、Web 与网络等 flash 敏感活动。
+ */
+esp_err_t ota_manager_mark_app_valid(void)
+{
+    if (!ota_manager_lock()) return ESP_ERR_NO_MEM;
+    esp_err_t err = ota_manager_mark_app_valid_locked();
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return err;
+}
+
+/** @brief 复制本次上传元数据并选择与运行分区不同的目标。
+ * @param[in] expected_size 非零镜像总字节数，须不超过目标容量。
+ * @param[in] upload_name 可空同步文本借用，净化后截断到内部容量。
+ * @param[in] browser_time 可空同步时间文本借用，过滤后保存。
+ * @return 成功、NO_MEM、INVALID_STATE、NOT_FOUND 或 INVALID_SIZE。
+ * @note 打开的句柄包括 ERROR 状态都拒绝覆盖，调用者先 cancel 再开始新事务。
+ */
+esp_err_t ota_manager_begin(size_t expected_size, const char *upload_name, const char *browser_time)
+{
+    if (!ota_manager_lock()) return ESP_ERR_NO_MEM;
+    esp_err_t err = ota_manager_begin_locked(expected_size, upload_name, browser_time);
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return err;
+}
+
+/** @brief 在单次锁持有内按顺序写入一块镜像，首个非空块触发原生 begin。
+ * @param[in] data 必填 len 字节稳定借用，零长度也要求非 NULL。
+ * @param[in] len 本块字节数，零长度无原生副作用。
+ * @return 原生结果、NO_MEM、状态/容量错误或无效魔数，失败可能已有 flash 前缀。
+ * @pre 外层以事务 owner 排除块间 cancel、begin 和重排序，并停止 flash 敏感活动。
+ */
+esp_err_t ota_manager_write(const void *data, size_t len)
+{
+    if (!ota_manager_lock()) return ESP_ERR_NO_MEM;
+    esp_err_t err = ota_manager_write_locked(data, len);
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return err;
+}
+
+/** @brief 校验总字节、消费原生更新句柄并设置下次启动分区。
+ * @return 原生结果或 NO_MEM，成功为 PENDING_REBOOT，NVS 时间写失败只记录诊断。
+ * @note end 返回即消费句柄，选 boot 失败时镜像仍已写入，cancel 不回滚 otadata。
+ */
+esp_err_t ota_manager_finish(void)
+{
+    if (!ota_manager_lock()) return ESP_ERR_NO_MEM;
+    esp_err_t err = ota_manager_finish_locked();
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return err;
+}
+
+/** @brief 串行 abort 尚存原生句柄并清除 RAM 事务，刷新实际 boot 信息。
+ * @post 不擦除已写镜像或撤销已选择的启动分区，锁创建失败时保留状态。
+ */
+void ota_manager_cancel(void)
+{
+    if (!ota_manager_lock()) return;
+    ota_manager_cancel_locked();
+    cc_mutex_unlock(s_ota_manager_mutex);
+}
+
+/** @brief 串行选择已存在的 APP 分区，选择当前 boot 时复用元数据。
+ * @param[in] label 同步 NUL 标签借用，NULL/空或不存在为 NOT_FOUND。
+ * @return 成功、NO_MEM、事务活动的 INVALID_STATE 或原生错误。
+ * @pre 外层已建立写 otadata 的离线窗口，成功选择不能由 RAM cancel 撤销。
+ */
+esp_err_t ota_manager_set_boot_partition(const char *label)
+{
+    if (!ota_manager_lock()) return ESP_ERR_NO_MEM;
+    esp_err_t err = ota_manager_set_boot_partition_locked(label);
+    cc_mutex_unlock(s_ota_manager_mutex);
+    return err;
+}
+
+/** @brief 在锁内复制管理器的一致 RAM 快照，字符串均为独立值。
+ * @param[out] out_status 可空槽，非空先清零，锁创建失败交付 ERROR 和诊断。
+ * @note 查询不建立 OTA 事务租约，分区元数据在 refresh 或状态变更时更新。
+ */
+void ota_manager_get_status(ota_manager_status_t *out_status)
+{
+    if (!out_status) return;
+    memset(out_status, 0, sizeof(*out_status));
+    if (!ota_manager_lock()) {
+        out_status->state = OTA_MANAGER_ERROR;
+        snprintf(out_status->error, sizeof(out_status->error), "OTA manager lock unavailable");
+        return;
+    }
+    ota_manager_get_status_locked(out_status);
+    cc_mutex_unlock(s_ota_manager_mutex);
 }

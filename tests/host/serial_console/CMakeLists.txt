@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(cclaw_serial_console_host C)
+find_package(Threads REQUIRED)
+add_executable(serial_console_host_test test_serial_console.c)
+target_include_directories(serial_console_host_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/stubs")
+target_link_libraries(serial_console_host_test PRIVATE Threads::Threads)
+enable_testing()
+add_test(NAME serial_console_host COMMAND serial_console_host_test)

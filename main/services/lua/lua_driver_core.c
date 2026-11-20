@@ -4,11 +4,12 @@
 #include "esp_system.h"
 #include "lauxlib.h"
 
-/*
- * 在栈顶 table 上设置一个整数键值对。
- * 参数: L     - Lua 状态指针（栈顶应为目标 table）
- * 参数: key   - 字段名
- * 参数: value - 整数值
+/**
+ * @brief 向栈顶堆信息 table 写入字节计数。
+ * @param[in,out] L 独占状态借用，栈顶为 table，处于 Lua 保护边界。
+ * @param[in] key 调用期非 NULL NUL 字段名，Lua 复制。
+ * @param[in] value 堆字节数，当前目标 size_t 可由 lua_Integer 表示。
+ * @post table 保留，临时整数消费，OOM 向保护调用传播。
  */
 static void lua_core_set_integer(lua_State *L, const char *key, size_t value)
 {
@@ -16,9 +17,11 @@ static void lua_core_set_integer(lua_State *L, const char *key, size_t value)
     lua_setfield(L, -2, key);
 }
 
-/*
- * cclaw.heap() —— 返回当前 ESP32 堆内存信息表。
- * 无参数。返回一个包含 free、min_free、internal_free、psram_free、psram_largest 字段的 table。
+/**
+ * @brief 实现无参数 cclaw.heap 并采样各能力堆。
+ * @param[in,out] L 独占有效状态借用，栈含本次参数。
+ * @return 成功推入一个拥有的 table 并返回 1，参数非零或 OOM 抛出 Lua 错误。
+ * @note 各字段单位为字节，各次采样反映对应调用时刻。
  */
 static int lua_cclaw_heap(lua_State *L)
 {
@@ -35,10 +38,10 @@ static int lua_cclaw_heap(lua_State *L)
     return 1;
 }
 
-/*
- * 注册 cclaw 全局 table，包含 heap() 函数。
- * 由 lua_driver 系统在 Lua 沙箱初始化时自动调用。
- * 参数: L - Lua 状态指针
+/**
+ * @brief 在新状态登记 cclaw 全局表及 heap 回调。
+ * @param[in,out] L 独占状态借用，由 runtime 在保护边界调用。
+ * @post table 交给 Lua 状态，C 回调常驻，注册 OOM 向保护调用传播。
  */
 static void lua_driver_core_register(lua_State *L)
 {

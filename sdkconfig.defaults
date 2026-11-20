@@ -18,12 +18,14 @@ CONFIG_LOG_DEFAULT_LEVEL=3
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 CONFIG_LOG_MAXIMUM_LEVEL=4
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Keep the first fault report available when Flash/cache access is broken.
+CONFIG_ESP_PANIC_HANDLER_IRAM=y
 
 CONFIG_SPIRAM_USE_MALLOC=y
 # Keep only small mallocs internal; medium/large runtime buffers prefer PSRAM.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
-# Reserve 160KB internal RAM for DMA, FreeRTOS internals, and cache-disabled paths.
-CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=163840
+# Reserve 128KiB internal RAM for DMA, FreeRTOS internals, and cache-disabled paths.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=131072
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 CONFIG_NVS_ALLOCATE_CACHE_IN_SPIRAM=y
 CONFIG_ESP_LVGL_ADAPTER_LVGL_THREAD_STACK_IN_PSRAM=y
@@ -33,7 +35,11 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 CONFIG_SPIRAM_MODE_OCT=y
-CONFIG_SPIRAM_SPEED_250M=y
+# 250 MHz failed the PSRAM boot memory test after OTA software reset on the
+# current S31 board. Use the SDK's 200 MHz baseline until warm boots are proven.
+# CONFIG_SPIRAM_SPEED_250M is not set
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_MEMTEST=y
 CONFIG_CAM_CTLR_DVP_CAM_ISR_CACHE_SAFE=y
 # CONFIG_ESP_BOARD_ESP32_S31_KORVO1=y
 # CONFIG_ESP_BOARD_NAME="esp32_s31_korvo1"
@@ -120,9 +126,7 @@ CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 
-# Allow debug clients to honor model.tls.verify=false.
-CONFIG_ESP_TLS_INSECURE=y
-CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+# Leave ESP-TLS certificate verification enabled by default.
 
 
 
@@ -158,3 +162,7 @@ CONFIG_CAMERA_OV3660_DVP_IF_FORMAT_INDEX_DEFAULT=0
 
 CONFIG_LV_USE_FS_MEMFS=y
 CONFIG_LV_FS_MEMFS_LETTER=77
+
+# Requires S31's independent ext_ram_xip_seg linker region. For older IDF,
+# apply patches/esp-idf-esp32s31-xip-region.patch to the selected IDF checkout.
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
