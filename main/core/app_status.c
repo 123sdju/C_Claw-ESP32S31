@@ -6,16 +6,13 @@
 #include "esp_timer.h"
 #include "usb_storage_service.h"
 
-/*
- * 采集运行时状态快照到 out_status 结构体。
- *
- * 参数:
- *   out_status - 输出参数，接收当前状态快照。
- *
- * 从各子系统采集最新指标：通过 esp_timer_get_time() 获取上电时间、
- * 从 usb_storage_service 查询 USB 挂载状态、从 board_camera 获取摄像头
- * 运行帧率和统计数据、从 network_service 获取网络连接状态。
- * 调用方可以周期性调用此函数来更新 app_context_t 中的 status 字段。
+/**
+ * @brief 按顺序采集上电时间、USB、摄像头和网络的观测快照。
+ * @param[out] out_status 调用者独占的输出存储，NULL 时直接返回。
+ * @post 非空输出先归零，再填充各子系统查询结果，结构体内数据均按值保存。
+ * @note 各查询独立同步，摄像头运行标志与统计也分次读取，因此字段可能来自相邻时刻。
+ *       network_service_get_status 锁竞争时提供保守状态，此接口沿用该观测语义。
+ *       采集可能等待子系统锁，适合任务上下文调用。
  */
 void app_status_collect(app_status_t *out_status)
 {

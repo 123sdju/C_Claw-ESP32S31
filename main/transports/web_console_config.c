@@ -4,13 +4,15 @@
 #include <string.h>
 
 #include "cc/util/cc_json.h"
+#include "cc/internal/cc_json_syntax_check.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 
-/*
- * 处理 GET /api/config 请求。通过全局上下文的 config_json 回调获取当前配置 JSON，
- * 以 application/json 类型返回。若回调未设置则返回空 JSON 对象 "{}"。
- * 参数: req - HTTP 请求句柄
- * 返回: ESP_OK 表示成功返回配置
+/**
+ * @brief 同步请求 owner 的脱敏配置快照，发送后归还拥有正文。
+ * @param[in,out] req 必填 HTTPD 请求借用，覆盖配置回调和响应发送期。
+ * @return 正文或错误响应的原生发送结果，快照不可用形成 HTTP 500，缺回调时发送空对象。
+ * @note 上下文由 Web 生命周期保活，回调自行同步配置快照，返回字符串须兼容 free。
  */
 esp_err_t web_console_config_get_handler(httpd_req_t *req)
 {
@@ -25,11 +27,13 @@ esp_err_t web_console_config_get_handler(httpd_req_t *req)
     return err;
 }
 
-/*
- * 处理 PUT /api/config 请求。接收请求体中的 JSON 配置（最大 64KB），
- * 先用 cc_json_parse 校验 JSON 格式合法性，再通过 config_applied 回调执行事务。
- * 参数: req - HTTP 请求句柄（content_len 指定 JSON 长度）
- * 返回: JSON 中包含每个子系统的应用结果和 restart_required；格式错误返回 400。
+/**
+ * @brief 在六十秒接收期限内取得完整配置对象，再同步委托应用 owner 执行事务。
+ * @param[in,out] req 必填 HTTPD 请求借用，content_len 须为一至 65536 字节，正文仅在事务回调期间借用。
+ * @return 原生响应发送结果，大小/JSON/对象错误为 HTTP 400，超时为 408，接收或缓冲失败为 500。
+ * 事务失败报告 HTTP 400 及阶段字段，成功发送阶段报告不额外承诺各动作的持久化状态。
+ * @note 原始及解码 NUL、非法 Unicode 和尾随内容在回调前拒绝。解析树、PSRAM 正文及诊断在本次调用内释放。
+ * 保存锁定、配置歧义、已安装但确认未知和旧对话保留均由 config_applied 的事务 owner 判断。
  */
 esp_err_t web_console_config_put_handler(httpd_req_t *req)
 {
@@ -44,12 +48,17 @@ esp_err_t web_console_config_put_handler(httpd_req_t *req)
 
     int remaining = req->content_len;
     char *write = buf;
+    int64_t deadline = esp_timer_get_time() + WEB_REQUEST_TIMEOUT_US;
     while (remaining > 0) {
+        if (esp_timer_get_time() >= deadline) {
+            heap_caps_free(buf);
+            return web_console_send_error(req, HTTPD_408_REQ_TIMEOUT, "config upload deadline exceeded");
+        }
         int n = httpd_req_recv(req, write, remaining);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
         }
-        if (n <= 0) {
+        if (n <= 0 || n > remaining) {
             heap_caps_free(buf);
             return web_console_send_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
         }
@@ -58,11 +67,17 @@ esp_err_t web_console_config_put_handler(httpd_req_t *req)
     }
     buf[req->content_len] = '\0';
 
+    if (memchr(buf, '\0', (size_t)req->content_len) || cc_storage_json_has_nul_escape(buf)) {
+        heap_caps_free(buf);
+        return web_console_send_error(req, HTTPD_400_BAD_REQUEST, "config contains NUL");
+    }
+
     cc_json_value_t *root = NULL;
-    cc_result_t rc = cc_json_parse(buf, &root);
+    cc_result_t rc = cc_json_parse_strict(buf, &root);
     if (rc.code != CC_OK || !root || !cc_json_is_object(root)) {
         char msg[160];
-        snprintf(msg, sizeof(msg), "%s", rc.message ? rc.message : cc_error_string(rc.code));
+        snprintf(msg, sizeof(msg), "%s", rc.code == CC_OK ? "config must be a JSON object" :
+            (rc.message ? rc.message : cc_error_string(rc.code)));
         cc_result_free(&rc);
         cc_json_destroy(root);
         heap_caps_free(buf);

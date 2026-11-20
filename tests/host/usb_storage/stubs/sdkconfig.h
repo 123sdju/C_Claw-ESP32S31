@@ -1,0 +1,3 @@
+#pragma once
+#define CONFIG_SPIRAM 0
+#define CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM 0

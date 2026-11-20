@@ -4,15 +4,20 @@
 
 #include "esp_err.h"
 
-/*
- * 应用生命周期主循环入口。
- *
- * 负责完整的启动序列：初始化上下文和事件总线、等待 USB 配置、启动
- * Agent 运行时和交互服务、初始化各传输层（串口、WiFi、Web 控制台）、
- * 启动摄像头预览，然后进入主事件循环处理 USB 热插拔。
- * 此函数在 app_main() 中调用且永不返回。
+/**
+ * @brief 从 app_main 装配启动依赖、恢复门禁和交互，成功后常驻处理 USB 生命周期。
+ * @pre 由唯一启动 owner 调用一次，配置事务、USB guard 和各全局服务均处于启动前状态。
+ * @post 成功启动后保持常驻，换盘走受控重启；早期初始化、NVS 前检或关键服务失败可返回。
+ * @note 启动分支分别保留诊断或执行分阶段回滚，回滚首个屏障失败时后续依赖继续存活。
+ * 交互 RUNNING 先于 Web/Camera/OTA 的最终收尾，boot_complete 发布后重启准备入口才可接纳。
  */
 void app_lifecycle_run(void);
 
-/* OTA 成功和显式重启共用的逆序 drain/stop/destroy 编排。 */
+/**
+ * @brief 关闭输入和 USB 操作接纳，按十三个依赖步骤排空重启所需服务。
+ * @param[in] timeout_ms 各步骤原样取得的毫秒预算，零采用 5000，整体时长还包含多步及端口清理。
+ * @return 启动尚未移交为 ESP_ERR_INVALID_STATE，shutdown 锁不可用为 ESP_ERR_TIMEOUT，其余返回首个失败步骤或 ESP_OK。
+ * @pre 当前任务位于待停止服务的回调之外，且未持有 USB owner guard；多个请求由 shutdown mutex 串行。
+ * @note 首个失败即停止推进，已关闭入口和剩余依赖保留供重试，是否实际重启由调用者决定。
+ */
 esp_err_t app_lifecycle_prepare_for_reboot(uint32_t timeout_ms);

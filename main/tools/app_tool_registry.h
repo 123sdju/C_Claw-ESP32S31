@@ -4,10 +4,10 @@
 
 #include "cc/app/cc_runtime_features.h"
 
-/*
- * 返回应用层工具描述符数组，包含 6 个工具（camera_capture / lua_run_code / lua_run_file /
- * lua_driver_info / lua_script_search / screen_draw），供运行时工具注册使用。
- * 参数: out_count - [出参] 接收工具描述符数量，可为 NULL
- * 返回: 静态工具描述符数组首地址
+/**
+ * @brief 查询摄像头、Lua 和屏幕的应用工具工厂描述符。
+ * @param[out] out_count 可选元素数输出，允许 NULL，当前固定数组包含六项。
+ * @return 进程期有效的只读借用数组，按返回的元素数遍历。
+ * @note 查询可并发执行，实例创建与资源清理由运行时 generation 装配流程负责。
  */
 const cc_tool_descriptor_t *app_tool_registry_descriptors(size_t *out_count);

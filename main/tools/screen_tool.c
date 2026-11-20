@@ -14,10 +14,10 @@ typedef struct {
     int unused;
 } screen_tool_t;
 
-/*
- * 返回工具名称标识符。
- * 参数: self - 工具实例指针（未使用）
- * 返回: 固定字符串 "screen_draw"
+/**
+ * @brief 查询屏幕工具名称。
+ * @param[in] self 未使用的实例借用，可 NULL。
+ * @return 常驻只读名称借用，可并发，无分配。
  */
 static const char *screen_tool_name(void *self)
 {
@@ -25,10 +25,10 @@ static const char *screen_tool_name(void *self)
     return "screen_draw";
 }
 
-/*
- * 返回工具功能描述字符串。
- * 参数: self - 工具实例指针（未使用）
- * 返回: 英文描述字符串
+/**
+ * @brief 查询屏幕工具描述。
+ * @param[in] self 未使用的实例借用，可 NULL。
+ * @return 常驻只读描述借用，可并发，无分配。
  */
 static const char *screen_tool_description(void *self)
 {
@@ -36,11 +36,10 @@ static const char *screen_tool_description(void *self)
     return "Draw or write content only inside the dedicated LCD Tool Area, isolated from the main conversation log";
 }
 
-/*
- * 返回 JSON Schema 字符串，定义 5 种操作（clear/append/text/rect/flush）及
- * 对应参数（role/text/x/y/width/height/color），op 为必填字段。
- * 参数: self - 工具实例指针（未使用）
- * 返回: JSON Schema 字符串
+/**
+ * @brief 查询五种绘制操作的参数 Schema。
+ * @param[in] self 未使用的实例借用，可 NULL。
+ * @return 常驻只读 JSON 借用，可并发，无分配。
  */
 static const char *screen_tool_schema_json(void *self)
 {
@@ -62,10 +61,10 @@ static const char *screen_tool_schema_json(void *self)
     "}";
 }
 
-/*
- * 将角色字符串映射为 board_conversation_role_t 枚举值。
- * 参数: role - 角色名（"tool"/"status"/"thinking"/"error"），NULL 或未知时默认 BOARD_CONV_TOOL
- * 返回: 对应的枚举值
+/**
+ * @brief 将可选角色字符串映射到 UI 枚举。
+ * @param[in] role 调用期 NUL 借用，可 NULL。
+ * @return 对应枚举，NULL/未知默认 tool，无分配，无共享可变状态。
  */
 static board_conversation_role_t parse_role(const char *role)
 {
@@ -84,11 +83,11 @@ static board_conversation_role_t parse_role(const char *role)
     return BOARD_CONV_TOOL;
 }
 
-/*
- * 解析 RGB565 十六进制颜色字符串（支持可选 "#" 前缀，如 "F800" 或 "#F800"）。
- * 参数: text - 颜色字符串，可为 NULL
- *       fallback - 解析失败时的默认颜色值
- * 返回: 16 位 RGB565 颜色值（仅当恰好 4 位十六进制字符时成功）
+/**
+ * @brief 解析可选井号及恰好四位 RGB565 颜色。
+ * @param[in] text 调用期 NUL 借用，可 NULL。
+ * @param[in] fallback 缺省或格式无效时采用的颜色。
+ * @return 成功转换值或 fallback，无分配，无共享状态。
  */
 static uint16_t parse_rgb565(const char *text, uint16_t fallback)
 {
@@ -116,13 +115,14 @@ static uint16_t parse_rgb565(const char *text, uint16_t fallback)
         }
     }
 
-    return digits == 4 ? (uint16_t)value : fallback;
+    return digits == 4 && text[4] == '\0' ? (uint16_t)value : fallback;
 }
 
-/*
- * 向工具调用结果写入错误状态，复制错误消息到 out_result->error。
- * 参数: out_result - 工具调用结果
- *       message - 错误消息，NULL 时使用默认 "screen_draw failed"
+/**
+ * @brief 向空结果写入工具失败状态。
+ * @param[out] out_result 非 NULL 独占空结果借用，错误副本由 cc_tool_result_cleanup 回收。
+ * @param[in] message 调用期 NUL 借用，NULL 用默认诊断。
+ * @post ok 为零，OOM 时 error 可 NULL，不覆盖已有拥有字段。
  */
 static void set_tool_error(cc_tool_result_t *out_result, const char *message)
 {
@@ -130,29 +130,25 @@ static void set_tool_error(cc_tool_result_t *out_result, const char *message)
     out_result->error = strdup(message ? message : "screen_draw failed");
 }
 
-/*
- * 判断 JSON 对象是否包含指定键。
- * 参数: root - JSON 对象
- *       key - 键名
- * 返回: true 存在，false 不存在或参数无效
+/**
+ * @brief 检查 JSON 对象是否含指定键。
+ * @param[in] root 调用期 JSON 借用，可 NULL。
+ * @param[in] key 调用期 NUL 键名借用，可 NULL。
+ * @return 存在为 true，参数无效或缺失为 false，无分配。
  */
 static bool json_has_key(cc_json_value_t *root, const char *key)
 {
     return root && key && cc_json_object_get(root, key) != NULL;
 }
 
-/*
- * 执行 screen_draw 工具调用：解析 JSON 参数中的 op 字段，分发到 5 种操作：
- *   clear  - 清空工具区域
- *   append - 在工具区域追加一行日志
- *   text   - 在指定坐标绘制文字（缺 x/y 时退化为 append）
- *   rect   - 在指定坐标绘制矩形（需 x/y/width/height）
- *   flush  - 请求刷新显示
- * 参数: self - 工具实例（未使用）
- *       args_json - JSON 参数字符串
- *       ctx - 工具上下文（未使用）
- *       out_result - [出参] 工具调用结果
- * 返回: 始终返回 CC_OK（错误信息写入 out_result）
+/**
+ * @brief 解析并分发清空、追加、坐标文字、矩形和刷新操作。
+ * @param[in] self 未使用实例借用，可 NULL。
+ * @param[in] args_json 调用期 NUL JSON 借用，NULL/空按空对象。
+ * @param[in] ctx 未使用上下文借用，可 NULL。
+ * @param[out] out_result 必填独占空结果，文本/诊断由 cc_tool_result_cleanup 回收。
+ * @return 输出 NULL 返回参数错误，其余 CC_OK，工具失败见 ok/error，OOM 文本可 NULL。
+ * @note JSON 临时树始终清理，UI 负责并发同步，缺坐标的 text 按追加处理。
  */
 static cc_result_t screen_tool_call(void *self,
                                     const char *args_json,
@@ -161,6 +157,10 @@ static cc_result_t screen_tool_call(void *self,
 {
     (void)self;
     (void)ctx;
+
+    if (!out_result) {
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null screen tool result");
+    }
 
     memset(out_result, 0, sizeof(*out_result));
     cc_media_artifact_list_init(&out_result->artifacts);
@@ -199,10 +199,7 @@ static cc_result_t screen_tool_call(void *self,
         board_ui_tool_area_append(role, text ? text : "");
 
     } else if (strcmp(op, "text") == 0) {
-        /*
-         * If x/y are omitted, do not draw at 0,0. Treat it as an append inside
-         * Tool Area so it cannot leave stale text in the main chat region.
-         */
+        /* 缺少 x/y 时按工具区域日志追加，避免默认坐标绘制留下过期文字。 */
         if (!json_has_key(root, "x") || !json_has_key(root, "y")) {
             board_ui_tool_area_append(role, text ? text : "");
         } else {
@@ -215,6 +212,9 @@ static cc_result_t screen_tool_call(void *self,
         if (!json_has_key(root, "x") || !json_has_key(root, "y") ||
             !json_has_key(root, "width") || !json_has_key(root, "height")) {
             board_ui_tool_area_append(BOARD_CONV_ERROR, "screen_draw rect missing x/y/width/height");
+            cc_json_destroy(root);
+            set_tool_error(out_result, "screen_draw rect missing x/y/width/height");
+            return cc_result_ok();
         } else {
             int x = cc_json_int_value(cc_json_object_get(root, "x"));
             int y = cc_json_int_value(cc_json_object_get(root, "y"));
@@ -239,9 +239,10 @@ static cc_result_t screen_tool_call(void *self,
     return cc_result_ok();
 }
 
-/*
- * 释放 screen_tool_t 工具实例的内存。
- * 参数: self - 工具实例指针
+/**
+ * @brief 回收屏幕工具实例。
+ * @param[in] self 转移拥有权的实例，可 NULL，调用者先等待进行中的调用完成。
+ * @post 实例失效，无其他拥有资源。
  */
 static void screen_tool_destroy(void *self)
 {
@@ -256,11 +257,11 @@ static const cc_tool_vtable_t s_screen_tool_vtable = {
     screen_tool_destroy,
 };
 
-/*
- * 创建 screen_draw 工具实例，分配 screen_tool_t 结构体并挂载虚函数表。
- * 参数: ctx - 工具工厂上下文（当前未使用）
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 成功，CC_ERR_INVALID_ARGUMENT 空输出指针，CC_ERR_OUT_OF_MEMORY 内存分配失败
+/**
+ * @brief 创建 screen_draw 工具并交付实例拥有权。
+ * @param[in] ctx 未使用工厂借用，可 NULL。
+ * @param[out] out_tool 必填独占空槽，有效槽入口清空，成功后用 vtable destroy 回收。
+ * @return CC_OK，输出 NULL 为参数错误，分配失败为 OOM，诊断由 cc_result_free 回收。
  */
 cc_result_t screen_tool_create(const cc_runtime_tool_factory_ctx_t *ctx, cc_tool_t *out_tool)
 {

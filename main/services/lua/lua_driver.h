@@ -4,42 +4,49 @@
 
 #include "lua.h"
 
+/**
+ * @brief 在独占 Lua 状态中登记驱动全局表。
+ * @param[in,out] L 有效状态借用，调用处位于 Lua 保护边界内，注册可因 OOM 抛出 Lua 错误。
+ * @post 注册后的 C 函数和描述符为进程期常驻，状态由 runtime 关闭。
+ */
 typedef void (*lua_driver_register_fn_t)(lua_State *L);
 
 typedef struct lua_driver_descriptor {
-    const char *name;
-    const char *global_name;
-    const char *summary;
-    const char *docs;
-    lua_driver_register_fn_t register_fn;
+    const char *name; /**< 进程期名称借用，可 NULL。 */
+    const char *global_name; /**< 进程期全局表名借用，可 NULL。 */
+    const char *summary; /**< 进程期摘要借用，可 NULL。 */
+    const char *docs; /**< 进程期文档借用，可 NULL。 */
+    lua_driver_register_fn_t register_fn; /**< 常驻注册回调，可 NULL 时跳过。 */
 } lua_driver_descriptor_t;
 
-/*
- * 遍历 lua_driver 注册表，逐个调用每个驱动的 register_fn(L) 注册到 Lua 环境。
- * 参数: L - Lua 状态指针
+/**
+ * @brief 遍历常驻注册表并在当前状态登记驱动。
+ * @param[in,out] L 独占状态借用，NULL 跳过，非空时调用者提供 Lua 保护边界。
+ * @post 不保留状态地址，成功注册的表归 Lua 状态拥有。
  */
 void lua_driver_register_all(lua_State *L);
-/*
- * 获取 lua_driver 注册表中驱动的数量。
- * 返回: 驱动数量
+/**
+ * @brief 查询常驻驱动数量。
+ * @return 编译期注册表元素数，无动态资源。
  */
 size_t lua_driver_count(void);
-/*
- * 按索引获取驱动描述符。
- * 参数: index - 驱动索引（从 0 开始）
- * 返回: 驱动描述符指针（越界返回 NULL）
+/**
+ * @brief 按索引查询常驻驱动。
+ * @param[in] index 从零开始的元素索引。
+ * @return 进程期只读描述符借用，越界返回 NULL。
  */
 const lua_driver_descriptor_t *lua_driver_at(size_t index);
-/*
- * 按名称查找驱动描述符（匹配 name 或 global_name）。
- * 参数: name - 驱动名称
- * 返回: 驱动描述符指针（未找到返回 NULL）
+/**
+ * @brief 按精确名称或全局表名查询驱动。
+ * @param[in] name 调用期 NUL 名称借用，NULL 或空串无匹配。
+ * @return 进程期只读描述符借用，找不到返回 NULL。
  */
 const lua_driver_descriptor_t *lua_driver_find(const char *name);
-/*
- * 在栈顶 table 上注册一个 Lua C 函数。
- * 参数: L    - Lua 状态指针（栈顶应为目标 table）
- * 参数: name - 函数名
- * 参数: fn   - C 函数指针
+/**
+ * @brief 将 C 函数写入栈顶 table 字段。
+ * @param[in,out] L 独占有效状态借用，栈顶必须是目标 table。
+ * @param[in] name 调用期有效 NUL 字段名，Lua 复制持有。
+ * @param[in] fn 进程期常驻非 NULL Lua C 函数。
+ * @post 栈顶 table 保持，字段更新，分配失败由调用者 Lua 保护边界接收。
  */
 void lua_driver_set_function(lua_State *L, const char *name, lua_CFunction fn);

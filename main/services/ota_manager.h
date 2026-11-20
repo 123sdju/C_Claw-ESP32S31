@@ -51,76 +51,77 @@ typedef struct {
     bool selected;
 } ota_manager_partition_info_t;
 
-/*
- * 将当前运行分区标记为有效/取消回滚。在 OTA 后验证 app 稳定时调用。
+/** @brief 串行确认运行镜像有效并刷新回滚状态。
+ * @return 原生确认结果或锁分配失败的 ESP_ERR_NO_MEM。
+ * @pre lifecycle owner 已完成健康判断并建立 otadata 写入所需的离线窗口。
  */
-void ota_manager_mark_app_valid(void);
-/*
- * 刷新分区状态信息（running/boot/target 分区标签、版本、SHA256、OTA 状态等）。
+esp_err_t ota_manager_mark_app_valid(void);
+/** @brief 锁内刷新 running、boot、target 的缓存元数据。
+ * @post 读取失败字段为空或 unknown，锁分配失败时保持原缓存，无输出所有权转移。
  */
 void ota_manager_refresh_status(void);
-/*
- * 开始 OTA 写入：选择目标分区、校验镜像大小、设置状态为 UPLOADING。
- * 参数: expected_size - 预期固件大小（字节）
- * 参数: upload_name   - 上传文件名（用于显示和 NVS 存储）
- * 参数: browser_time  - 浏览器上传时间（存 NVS，用于分区 uploaded_at）
- * 返回: ESP_OK 成功，ESP_ERR_NOT_FOUND 无可用分区，ESP_ERR_INVALID_SIZE 大小超限
+/** @brief 复制上传元数据并建立尚未打开原生 writer 的事务。
+ * @param[in] expected_size 非零 BIN 字节数，须不超过目标 APP 分区容量。
+ * @param[in] upload_name 可空同步 NUL 名称借用，净化后截断复制，仅用于显示。
+ * @param[in] browser_time 可空同步 NUL 时间借用，过滤复制，finish 后写 NVS。
+ * @return 成功、NO_MEM、INVALID_STATE、NOT_FOUND 或 INVALID_SIZE。
+ * @note 每次调用串行，外层事务 owner 须排除块间重排和其他事务。
+ * 尚存 writer 时包括 ERROR 状态均拒绝覆盖，先 cancel 释放句柄。
  */
 esp_err_t ota_manager_begin(size_t expected_size, const char *upload_name, const char *browser_time);
-/*
- * 写入 OTA 数据块。首次写入时校验 ESP 镜像魔数字节。
- * 参数: data - 数据缓冲区
- * 参数: len  - 写入字节数
- * 返回: ESP_OK 成功
+/** @brief 首个非空块校验魔数并创建 writer，再同步写入目标分区。
+ * @param[in] data 必填 len 字节稳定借用，零长度也要求非 NULL。
+ * @param[in] len 本块字节数，零长度无原生副作用，须不超过声明剩余量。
+ * @return 原生写入结果、NO_MEM、状态/容量错误或无效魔数。
+ * @pre 事务 owner 保证块顺序及离线窗口，失败后仍可能拥有 writer 和 flash 前缀。
  */
 esp_err_t ota_manager_write(const void *data, size_t len);
-/*
- * 完成 OTA 写入：调用 esp_ota_end、设置启动分区、记录 uploaded_at 到 NVS。
- * 返回: ESP_OK 成功，状态变为 PENDING_REBOOT
+/** @brief 检查总量、消费 writer 并提交下次启动分区。
+ * @return 原生结果或 NO_MEM，成功转 PENDING_REBOOT，时间 NVS 写失败仅记录日志。
+ * @post esp_ota_end 返回即消费句柄，boot 提交失败仍保留已写镜像。
  */
 esp_err_t ota_manager_finish(void);
-/*
- * 取消 OTA 操作：如有打开的更新句柄则 abort，重置所有状态为 IDLE。
+/** @brief 串行 abort 尚存 writer 并清空 RAM 事务后刷新分区信息。
+ * @post 保留 flash 镜像及已提交 boot 选择，锁分配失败时保持状态。
  */
 void ota_manager_cancel(void);
-/*
- * 设置指定标签的分区为下次启动分区。
- * 参数: label - 分区标签
- * 返回: ESP_OK 成功，ESP_ERR_NOT_FOUND 分区不存在
+/** @brief 串行选择指定 APP 分区作为 boot 并刷新缓存。
+ * @param[in] label 同步 NUL 标签借用，NULL/空或未知返回 NOT_FOUND。
+ * @return 成功、NO_MEM、活动事务的 INVALID_STATE 或原生错误。
+ * @pre owner 已建立 otadata 离线写入窗口，成功选择无法通过 cancel 撤销。
  */
 esp_err_t ota_manager_set_boot_partition(const char *label);
-/*
- * 获取下一个可用于 OTA 更新的分区信息（大小和标签）。
- * 参数: out_size    - 输出分区大小
- * 参数: out_label   - 输出分区标签缓冲区
- * 参数: label_size  - 标签缓冲区大小
- * 返回: ESP_OK 成功，ESP_ERR_NOT_FOUND 无可用分区
+/** @brief 采样下一个更新分区的容量和标签。
+ * @param[out] out_size 可空独占字节数槽，无目标写零。
+ * @param[out] out_label 可空独占标签槽，非零容量时截断并终止，无目标为空串。
+ * @param[in] label_size 标签字节容量，含 NUL，零时跳过。
+ * @return 成功或 NOT_FOUND，全部输出按值，不建立事务租约。
  */
 esp_err_t ota_manager_get_next_update_partition_info(size_t *out_size, char *out_label, size_t label_size);
-/*
- * 枚举所有 APP 类型分区，填充分区信息数组（标签、app 名、版本、SHA256、上传时间等）。
- * 参数: out_partitions - 输出数组
- * 参数: max_partitions - 数组容量
- * 返回: 实际分区数量（可能大于 max_partitions）
+/** @brief 枚举全部 APP 分区并按容量复制独立元数据。
+ * @param[out] out_partitions 可空独占数组，NULL 只统计总数。
+ * @param[in] max_partitions 可写元素容量，零时不填写。
+ * @return 实际分区总数，可大于容量，有效填写数为二者较小值。
+ * @note 原生迭代器本层释放，各分区独立采样，摘要为 ELF app_desc 字段。
  */
 size_t ota_manager_get_partitions(ota_manager_partition_info_t *out_partitions, size_t max_partitions);
-/*
- * 重启设备（调用 esp_restart）。
+/** @brief 调用 esp_restart 复位设备，正常不返回。
+ * @pre lifecycle owner 已执行所有必要关闭和排空屏障。
  */
 void ota_manager_reboot(void);
-/*
- * 获取 OTA 管理器当前状态快照。
- * 参数: out_status - 输出状态结构体指针
+/** @brief 锁内复制一致 RAM 快照，字符串按值保存。
+ * @param[out] out_status 可空独占槽，非空先清零，锁创建失败交付 ERROR 诊断。
+ * @note 分区元数据来自最近 refresh 或状态变更，本函数无堆输出。
  */
 void ota_manager_get_status(ota_manager_status_t *out_status);
-/*
- * 将 OTA 状态枚举转换为可读字符串。
- * 参数: state - 状态枚举
- * 返回: 对应的字符串（"idle"/"uploading"/"pending_reboot"/"error"/"unknown"）
+/** @brief 将管理器状态映射为诊断文本。
+ * @param[in] state 任意枚举值。
+ * @return 进程期常量借用，未知值为 unknown，可并发调用，无释放责任。
  */
 const char *ota_manager_state_string(ota_manager_state_t state);
-/*
- * 获取上次错误描述（无错误时返回 "none"）。
- * 返回: 错误字符串
+/** @brief 借回最近错误文本，无错误时为常量 none。
+ * @return 内部借用或锁失败的常量诊断，调用者不得释放。
+ * @pre 外层 owner 在保留文本期间排除 begin、cancel 和其他错误更新。
+ * @note 需要可并发保留的错误文本时使用 get_status 的按值 error 字段。
  */
 const char *ota_manager_last_error(void);

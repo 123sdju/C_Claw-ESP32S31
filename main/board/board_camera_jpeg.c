@@ -8,27 +8,21 @@
 #include "mbedtls/base64.h"
 #include <stdint.h>
 
-/*
- * 使用 ESP32 硬件 JPEG 编码器将 RGB565 原始数据编码为 JPEG。
- *
- * 流程：
- *  1. 参数校验（raw 非空、尺寸有效、输出指针有效）和质量裁剪 (1-100)。
- *  2. 创建 JPEG 编码器引擎 (jpeg_new_encoder_engine)，超时 200ms。
- *  3. 分配编码器输出内存 (jpeg_alloc_encoder_mem)。
- *  4. 配置编码参数：RGB565 输入、YUV422 子采样、指定质量/宽高。
- *  5. 调用 jpeg_encoder_process 执行编码。
- *  6. 释放编码器引擎，失败时释放已分配的输出内存。
- *
- * 参数:
- *   raw          - RGB565 原始像素数据
- *   raw_bytes    - 原始数据字节数
- *   width        - 图像宽度（像素）
- *   height       - 图像高度（像素）
- *   quality      - JPEG 质量 (1-100)，越界自动裁剪
- *   out_jpeg     - 输出 JPEG 数据指针（调用者负责 free）
- *   out_jpeg_size- 输出 JPEG 数据大小
- * 返回: ESP_OK 成功，ESP_ERR_INVALID_ARG 参数无效，ESP_ERR_NO_MEM 内存不足，
- *       其他 ESP 错误码表示编码失败。
+/* 当前目标 JPEG 编码硬件的宽高各支持十四位，由 soc/jpeg_struct.h 的 pic_size 定义。 */
+#define BOARD_CAMERA_JPEG_MAX_DIMENSION 16383U
+
+/**
+ * @brief 将紧密 RGB565 矩形同步编码为 YUV422 子采样的 JPEG。
+ * @param[in] raw 调用期稳定的紧密像素借用，硬件完成前保持有效。
+ * @param[in] raw_bytes 输入缓冲容量，必须覆盖 width*height*2，仅编码矩形部分。
+ * @param[in] width 正像素宽度，最大 16383，符合当前硬件十四位限制。
+ * @param[in] height 正像素高度，最大 16383。
+ * @param[in] quality 一至一百，低于一采用七十，高于一百采用一百。
+ * @param[out] out_jpeg 独立的新/已清理指针槽，存在时先置 NULL，成功交付 free 兼容数据。
+ * @param[out] out_jpeg_size 独立大小槽，存在时先置零，成功为有效 JPEG 字节数。
+ * @return 成功或参数、尺寸、分配、驱动/释放错误，失败归还本次输出分配。
+ * @note 每次独立创建引擎，原生共享编解码锁负责硬件串行。200 ms 配置用于原生
+ *       编码事件等待，锁等待和整个调用耗时遵循当前 IDF 驱动实现。
  */
 esp_err_t board_camera_encode_rgb565_jpeg(uint8_t *raw,
                                           size_t raw_bytes,
@@ -38,12 +32,19 @@ esp_err_t board_camera_encode_rgb565_jpeg(uint8_t *raw,
                                           uint8_t **out_jpeg,
                                           size_t *out_jpeg_size)
 {
+    if (out_jpeg) *out_jpeg = NULL;
+    if (out_jpeg_size) *out_jpeg_size = 0;
     if (!raw || raw_bytes == 0 || width <= 0 || height <= 0 || !out_jpeg || !out_jpeg_size) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    *out_jpeg = NULL;
-    *out_jpeg_size = 0;
+    if ((unsigned)width > BOARD_CAMERA_JPEG_MAX_DIMENSION ||
+        (unsigned)height > BOARD_CAMERA_JPEG_MAX_DIMENSION ||
+        (size_t)width > SIZE_MAX / 2U ||
+        (size_t)height > SIZE_MAX / ((size_t)width * 2U)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t input_bytes = (size_t)width * 2U * (size_t)height;
+    if (raw_bytes < input_bytes || input_bytes > UINT32_MAX) return ESP_ERR_INVALID_SIZE;
 
     if (quality < 1) {
         quality = 70;
@@ -67,11 +68,16 @@ esp_err_t board_camera_encode_rgb565_jpeg(uint8_t *raw,
     };
 
     size_t jpeg_alloc_size = 0;
-    uint8_t *jpeg = jpeg_alloc_encoder_mem(raw_bytes, &out_mem_cfg, &jpeg_alloc_size);
+    uint8_t *jpeg = jpeg_alloc_encoder_mem(input_bytes, &out_mem_cfg, &jpeg_alloc_size);
 
     if (!jpeg) {
         jpeg_del_encoder_engine(jpeg_handle);
         return ESP_ERR_NO_MEM;
+    }
+    if (jpeg_alloc_size < input_bytes || jpeg_alloc_size > UINT32_MAX) {
+        jpeg_del_encoder_engine(jpeg_handle);
+        free(jpeg);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     jpeg_encode_cfg_t encode_cfg = {
@@ -86,12 +92,14 @@ esp_err_t board_camera_encode_rgb565_jpeg(uint8_t *raw,
     ret = jpeg_encoder_process(jpeg_handle,
                                &encode_cfg,
                                raw,
-                               raw_bytes,
+                               (uint32_t)input_bytes,
                                jpeg,
-                               jpeg_alloc_size,
+                               (uint32_t)jpeg_alloc_size,
                                &jpeg_size);
 
-    jpeg_del_encoder_engine(jpeg_handle);
+    esp_err_t release_ret = jpeg_del_encoder_engine(jpeg_handle);
+    if (ret == ESP_OK) ret = release_ret;
+    if (ret == ESP_OK && (jpeg_size == 0 || jpeg_size > jpeg_alloc_size)) ret = ESP_ERR_INVALID_SIZE;
 
     if (ret != ESP_OK) {
         free(jpeg);
@@ -103,28 +111,22 @@ esp_err_t board_camera_encode_rgb565_jpeg(uint8_t *raw,
     return ESP_OK;
 }
 
-/*
- * 使用 mbedtls_base64 将 JPEG 二进制数据编码为 Base64 字符串。
- *
- * 两步编码：先调用 mbedtls_base64_encode 获取所需长度，再分配足够内存执行实际编码。
- * 输出字符串以 '\0' 结尾。
- *
- * 参数:
- *   jpeg       - JPEG 二进制数据指针
- *   jpeg_size  - JPEG 数据字节数
- *   out_base64 - 输出 Base64 字符串指针（调用者负责 free）
- * 返回: ESP_OK 成功，ESP_ERR_INVALID_ARG 参数无效，ESP_ERR_NO_MEM 内存不足，
- *       ESP_FAIL Base64 编码失败。
+/**
+ * @brief 两次调用原生 Base64 编码器，精确分配含终止符的输出空间。
+ * @param[in] jpeg 调用期稳定的二进制借用。
+ * @param[in] jpeg_size 正输入字节数，原生长度计算溢出时拒绝。
+ * @param[out] out_base64 必需新/已清理槽，存在时先置 NULL，成功由调用者 free。
+ * @return 成功、参数/尺寸/分配错误或原生编码失败，失败不发布部分文本。
+ * @note 所有状态和分配归本次调用，输入缓冲稳定时可并发执行。
  */
 esp_err_t board_camera_jpeg_to_base64(const uint8_t *jpeg,
                                       size_t jpeg_size,
                                       char **out_base64)
 {
+    if (out_base64) *out_base64 = NULL;
     if (!jpeg || jpeg_size == 0 || !out_base64) {
         return ESP_ERR_INVALID_ARG;
     }
-
-    *out_base64 = NULL;
 
     size_t base64_len = 0;
     int ret = mbedtls_base64_encode(NULL, 0, &base64_len, jpeg, jpeg_size);
@@ -132,20 +134,21 @@ esp_err_t board_camera_jpeg_to_base64(const uint8_t *jpeg,
         return ESP_FAIL;
     }
 
-    if (base64_len == SIZE_MAX) {
+    if (base64_len == 0 || base64_len == SIZE_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
-    char *base64 = malloc(base64_len + 1U);
+    size_t capacity = base64_len;
+    char *base64 = malloc(capacity);
     if (!base64) {
         return ESP_ERR_NO_MEM;
     }
 
     ret = mbedtls_base64_encode((unsigned char *)base64,
-                                base64_len,
+                                capacity,
                                 &base64_len,
                                 jpeg,
                                 jpeg_size);
-    if (ret != 0) {
+    if (ret != 0 || base64_len >= capacity) {
         free(base64);
         return ESP_FAIL;
     }
@@ -155,13 +158,11 @@ esp_err_t board_camera_jpeg_to_base64(const uint8_t *jpeg,
     return ESP_OK;
 }
 
-/*
- * 释放 board_camera_jpeg_t 结构体占用的堆内存并清零。
- *
- * 释放 jpeg_data（原始 JPEG 数据），然后清零结构体避免野指针。
- *
- * 参数:
- *   image - 要清理的结构体指针，NULL 时直接返回。
+/**
+ * @brief 消费 JPEG 数据并清零记录，保留调用者的结构体存储。
+ * @param[in,out] image 独占且已初始化的记录，允许 NULL，数据须兼容 free。
+ * @post 数据归还且字段归零，空记录可重复清理。
+ * @note 拥有者先结束所有数据借用，按值复制记录时须明确唯一释放责任。
  */
 void board_camera_jpeg_cleanup(board_camera_jpeg_t *image)
 {

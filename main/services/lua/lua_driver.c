@@ -10,11 +10,12 @@ static const lua_driver_descriptor_t *const s_lua_drivers[] = {
     &g_board_lua_screen_driver,
 };
 
-/*
- * 在栈顶 table 上注册一个 Lua C 函数为指定名称的字段。
- * 参数: L    - Lua 状态指针（栈顶应为目标 table）
- * 参数: name - Lua 函数名
- * 参数: fn   - C 函数指针
+/**
+ * @brief 在栈顶 table 登记常驻 C 回调。
+ * @param[in,out] L 独占有效状态借用，栈顶为 table，调用者提供保护边界。
+ * @param[in] name 调用期有效 NUL 字段名，由 Lua 复制。
+ * @param[in] fn 非 NULL 常驻函数地址。
+ * @post 消费临时函数栈值并保留原 table，OOM 以 Lua 错误传播。
  */
 void lua_driver_set_function(lua_State *L, const char *name, lua_CFunction fn)
 {
@@ -22,9 +23,10 @@ void lua_driver_set_function(lua_State *L, const char *name, lua_CFunction fn)
     lua_setfield(L, -2, name);
 }
 
-/*
- * 遍历 s_lua_drivers[] 注册表，对每个有效的驱动描述符调用其 register_fn(L) 注册到 Lua 全局环境。
- * 参数: L - Lua 状态指针
+/**
+ * @brief 顺序调用常驻描述符的注册回调。
+ * @param[in,out] L 独占状态借用，NULL 跳过，非空时位于 Lua 保护边界内。
+ * @post 全局表归状态拥有，本模块不保留 L，注册失败由保护调用清理状态。
  */
 void lua_driver_register_all(lua_State *L)
 {
@@ -40,19 +42,19 @@ void lua_driver_register_all(lua_State *L)
     }
 }
 
-/*
- * 返回注册表中驱动的总数。
- * 返回: 驱动数量
+/**
+ * @brief 查询编译期驱动表长度。
+ * @return 驱动元素数量，无动态分配。
  */
 size_t lua_driver_count(void)
 {
     return sizeof(s_lua_drivers) / sizeof(s_lua_drivers[0]);
 }
 
-/*
- * 按索引获取驱动描述符。
- * 参数: index - 驱动索引（0-based）
- * 返回: 描述符指针，越界返回 NULL
+/**
+ * @brief 读取指定常驻描述符。
+ * @param[in] index 从零开始的索引。
+ * @return 进程期只读借用，越界为 NULL。
  */
 const lua_driver_descriptor_t *lua_driver_at(size_t index)
 {
@@ -62,10 +64,10 @@ const lua_driver_descriptor_t *lua_driver_at(size_t index)
     return s_lua_drivers[index];
 }
 
-/*
- * 按名称查找驱动描述符，匹配 name 或 global_name 字段。
- * 参数: name - 驱动名
- * 返回: 描述符指针，未找到返回 NULL
+/**
+ * @brief 匹配描述符的名称或全局表名。
+ * @param[in] name 调用期 NUL 文本借用，NULL/空串返回 NULL。
+ * @return 进程期只读借用，无匹配为 NULL，比较区分大小写。
  */
 const lua_driver_descriptor_t *lua_driver_find(const char *name)
 {

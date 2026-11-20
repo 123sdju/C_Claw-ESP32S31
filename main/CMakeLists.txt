@@ -1,20 +1,31 @@
+#[[
+  @brief 将产品组合根、服务、板级适配、界面、传输和工具注册为 main 组件。
+  @note 本文件在 ESP-IDF 配置阶段执行，无自定义函数和运行期资源。
+  SRCS 显式列出产品编译单元，子目录承担模块边界，新增源码时在此登记。
+  PRIV_REQUIRES 交付产品实现所需的 IDF/托管组件依赖，私有头路径只供本组件编译。
+  SDK 普通 CMake 目标由工程根创建，再链接到本组件，BSP 负责实际板卡与外设。
+  配置或依赖解析失败由 IDF 终止本次生成，实际优化、分节和固件大小由编译产物核对。
+]]
 idf_component_register(SRCS
                            "core/app_main.c"
                            "core/app_config.c"
                            "core/app_context.c"
                            "core/app_lifecycle.c"
+                           "core/app_shutdown_sequence.c"
+                           "core/app_usb_owner_guard.c"
                            "core/app_status.c"
                            "core/cclaw_runtime_features.c"
                            "board/board_camera.c"
                            "board/board_camera_jpeg.c"
                            "board/board_camera_rgb565.c"
-                           "board/board_conversation.c"
-                           "board/board_display.c"
-                           "board/board_ui_snapshot.c"
-                           "board/board_ui_font.c"
-                           "board/board_ui_json.c"
-                           "board/board_ui.c"
-                           "board/lua/board_lua_screen.c"
+                           "board/board_lcd.c"
+                           "ui/board_conversation.c"
+                           "ui/board_display.c"
+                           "ui/board_ui_snapshot.c"
+                           "ui/board_ui_font.c"
+                           "ui/board_ui_json.c"
+                           "ui/board_ui.c"
+                           "ui/board_lua_screen.c"
                            "services/command_service.c"
                            "services/app_profile.c"
                            "services/interaction_service.c"
@@ -22,8 +33,22 @@ idf_component_register(SRCS
                            "services/ota_manager.c"
                            "services/ota_service.c"
                            "services/runtime_service.c"
+                           "services/recovery_service.c"
+                           "services/recovery_console.c"
+                           "services/manual_lua_service.c"
+                           "services/memory_console.c"
+                           "services/managed_memory_service.c"
+                           "services/startup_managed_memory.c"
+                           "services/history_view.c"
+                           "services/startup_gate.c"
+                           "services/startup_recovery.c"
+                           "services/session_selection.c"
+                           "services/session_memory_turns.c"
+                           "services/session_menu.c"
+                           "services/storage_nvs_service.c"
                            "services/usb_storage_service.c"
                            "services/wifi_app.c"
+                           "services/wifi_event_callback.c"
                            "services/events/app_event_bus.c"
                            "services/events/app_event_display_sink.c"
                            "services/events/app_event_log_hooks.c"
@@ -74,12 +99,13 @@ idf_component_register(SRCS
                            esp_lvgl_adapter
                            esp_board_manager
                            esp_cam_sensor
+                           esp_video
                            fatfs
                            nvs_flash
-                       INCLUDE_DIRS
+                       PRIV_INCLUDE_DIRS
                            "core"
                            "board"
-                           "board/lua"
+                           "ui"
                            "services"
                            "services/events"
                            "services/lua"

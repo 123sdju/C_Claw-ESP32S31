@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import os
 import queue
 import random
@@ -25,13 +26,50 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib import error, parse, request
+from urllib import parse
 
 
 DEFAULT_HOST = "http://cclaw.local/"
 DEFAULT_SERIAL_PORT = "COM6"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_OUTPUT_DIR = os.path.join("outputs", "long_run_cclaw")
+STRESS_DEFAULTS = {
+    "duration": "1h", "interval": 1.0, "conversation_interval": 2.0,
+    "long_conversation_interval": 60.0, "long_conversation_turns": 8,
+    "event_poll_interval": 0.5, "event_limit": 1000,
+    "conversation_timeout": 200.0, "long_conversation_timeout": 200.0,
+    "idle_timeout": 190.0,
+}
+
+# A valid CPU window with <=1% idle on a core is evidence of possible
+# starvation. It is reported as a streak so short sampling noise is visible
+# without turning a host-side observation into an automatic board verdict.
+CPU_IDLE_STARVATION_THRESHOLD_PCT = 1.0
+
+
+class RunStopped(BaseException):
+    """Unwind nested conversation waits without classifying a user stop as HTTP failure."""
+
+
+def poll_checkpoint(http: "HttpClient") -> None:
+    callback = getattr(http, "checkpoint", None)
+    if callback:
+        callback()
+
+
+def poll_sleep(http: "HttpClient", seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        poll_checkpoint(http)
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
+def event_cursor(payload: dict[str, Any], previous: int) -> int:
+    """Accept the new firmware epoch after reboot; never retain a stale high cursor."""
+    if payload.get("cursor_reset") is True:
+        previous = 0
+    seqs = [event_seq(e) for e in payload.get("events", []) if isinstance(e, dict)]
+    return max([previous, safe_int(payload.get("latest_seq")), *seqs])
 ALL_TEST_ITEMS = {
     "status",
     "events",
@@ -115,6 +153,42 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def valid_percentage(value: Any) -> float | None:
+    """只接受有限的 0..100 百分比，不把异常值静默夹回合法范围。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0 or number > 100.0:
+        return None
+    return number
+
+
+def cpu_frame_is_valid(cpu: dict[str, Any], payload: dict[str, Any] | None = None) -> bool:
+    """只接受新版带明确时间窗口的 CPU 快照。"""
+    if cpu.get("available") is not True or cpu.get("runtime_stats") is False:
+        return False
+    if cpu.get("valid") is not True:
+        return False
+    window_ms = cpu.get("window_ms")
+    if (isinstance(window_ms, bool) or not isinstance(window_ms, (int, float)) or
+            not math.isfinite(float(window_ms)) or float(window_ms) <= 0.0):
+        return False
+    if payload and payload.get("partial"):
+        return False
+    return True
+
+
+def cpu_task_identity(task: dict[str, Any]) -> tuple[str, int | None, str]:
+    """以 FreeRTOS task number 区分同名任务，旧数据没有 ID 时退回名称。"""
+    name = str(task.get("name") or task.get("n") or "unknown")
+    raw_id = task.get("task_id") if "task_id" in task else task.get("id")
+    task_id = None if isinstance(raw_id, bool) or raw_id is None else safe_int(raw_id, -1)
+    if task_id is not None and task_id < 0:
+        task_id = None
+    key = f"id:{task_id}:{name}" if task_id is not None else f"name:{name}"
+    return key, task_id, name
 
 
 def event_seq(event: dict[str, Any]) -> int:
@@ -207,9 +281,11 @@ def classify_http_error(message: str) -> str:
     lower = (message or "").lower()
     if "getaddrinfo" in lower or "name or service" in lower or "dns" in lower:
         return "dns_or_mdns"
+    if "remote end closed connection without response" in lower or "remotedisconnected" in lower:
+        return "peer_closed"
     if "timed out" in lower or "timeout" in lower:
         return "timeout"
-    if "connection reset" in lower or "connection aborted" in lower or "forcibly closed" in lower:
+    if "connection reset" in lower or "connection aborted" in lower or "forcibly closed" in lower or "winerror 10054" in lower or "econnreset" in lower:
         return "connection_reset"
     if "connection refused" in lower:
         return "connection_refused"
@@ -248,6 +324,10 @@ def classify_conversation_failure(ok: bool, timing: dict[str, Any], context_ok: 
                 safe_int(timing.get("first_token_ms"), -1) >= 0
             )
             return "partial_stream_failure" if has_partial_output else "transport_failure"
+        if "cc_err_json" in lower_error or "tool_calls" in lower_error or "stream_parse" in lower_error:
+            return "model_protocol_error"
+        if "tool execution" in lower_error or "tool.error" in lower_error:
+            return "tool_execution_failure"
         return "runtime_error"
     if timing.get("error_event_count", 0):
         return "error_event"
@@ -359,8 +439,47 @@ class JsonlWriter:
             self._file.close()
 
 
+class AddressResolver:
+    """Share short-lived DNS results, not sockets, across one test session."""
+    def __init__(self, ttl: float = 60.0):
+        self.ttl = ttl
+        self._lock = threading.Lock()
+        self._cache: dict[tuple[str, int], tuple[float, list]] = {}
+
+    def resolve(self, host: str, port: int, timing: dict) -> tuple[list, bool]:
+        with self._lock:
+            cached = self._cache.get((host, port))
+            if cached and cached[0] > time.monotonic():
+                timing["dns_cache_hit"] = True
+                return cached[1], True
+            started = time.monotonic()
+            try:
+                # This retry precedes socket creation and sends no HTTP data.
+                for attempt in range(2):
+                    try:
+                        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+                        if not addresses:
+                            raise socket.gaierror("DNS returned no addresses")
+                        self._cache[(host, port)] = (time.monotonic() + self.ttl, addresses)
+                        return addresses, False
+                    except socket.gaierror:
+                        timing["dns_lookup_failures"] = timing.get("dns_lookup_failures", 0) + 1
+                        if attempt:
+                            raise
+                        time.sleep(.05)
+            finally:
+                timing["dns_ms"] = round((time.monotonic() - started) * 1000, 3)
+
+    def invalidate(self, host: str, port: int, addresses: list) -> None:
+        with self._lock:
+            cached = self._cache.get((host, port))
+            if cached and cached[1] is addresses:
+                self._cache.pop((host, port), None)
+
+
 class HttpClient:
-    def __init__(self, host: str, timeout: float, persistent: bool = True):
+    def __init__(self, host: str, timeout: float, persistent: bool = True,
+                 resolver: AddressResolver | None = None):
         """处理 scripts/long_run_test.py 中的 init 逻辑。
 
         该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
@@ -379,6 +498,10 @@ class HttpClient:
         self._conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
         self.connection_rebuilds = 0
         self.last_timing: dict[str, Any] = {}
+        self.resolver = resolver if resolver is not None else AddressResolver()
+
+    def fork(self) -> "HttpClient":
+        return HttpClient(self.base, self.timeout, self.persistent, resolver=self.resolver)
 
     def _url(self, path: str, query: dict[str, Any] | None = None) -> str:
         """处理 scripts/long_run_test.py 中的 url 逻辑。
@@ -415,109 +538,102 @@ class HttpClient:
                 pass
             self._conn = None
 
-    def _measure_dns_ms(self) -> float | None:
-        """处理 scripts/long_run_test.py 中的 measure dns ms 逻辑。
+    def _connect_resolved(self, address, timeout, source_address=None):
+        """Connect to getaddrinfo's sockaddr directly; keep HTTP/TLS hostname intact."""
+        host, port = address
+        deadline = time.monotonic() + timeout
+        last_error = None
+        for refresh in range(2):
+            addresses, cached = self.resolver.resolve(host, port, self.last_timing)
+            for family, socktype, proto, _, sockaddr in addresses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if last_error:
+                        raise last_error
+                    raise TimeoutError("connection deadline exceeded after DNS lookup")
+                sock = None
+                try:
+                    sock = socket.socket(family, socktype, proto)
+                    sock.settimeout(remaining)
+                    if source_address:
+                        sock.bind(source_address)
+                    sock.connect(sockaddr)
+                    sock.settimeout(timeout)
+                    self.last_timing["peer_address"] = sockaddr[0]
+                    return sock
+                except OSError as exc:
+                    last_error = exc
+                    if sock is not None:
+                        sock.close()
+            self.resolver.invalidate(host, port, addresses)
+            if not cached or refresh:
+                break
+            # A cached DHCP address may have changed. Refresh before sending
+            # any HTTP bytes; never retry an already dispatched POST.
+        raise last_error or OSError("no usable address for HTTP connection")
 
-        该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
-        在实现变化时与项目文档同步维护。
-        """
-        if not self.hostname:
-            return None
-        start = time.monotonic()
-        socket.getaddrinfo(self.hostname, self.port, type=socket.SOCK_STREAM)
-        return (time.monotonic() - start) * 1000.0
-
-    def _ensure_conn(self) -> tuple[http.client.HTTPConnection | http.client.HTTPSConnection, bool, float | None]:
-        """处理 scripts/long_run_test.py 中的 ensure conn 逻辑。
-
-        该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
-        在实现变化时与项目文档同步维护。
-        """
-        reused = self._conn is not None
-        dns_ms: float | None = None
+    def _ensure_conn(self):
+        reused = self._conn is not None and self._conn.sock is not None
         if self._conn is None:
-            dns_ms = self._measure_dns_ms()
             cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
             self._conn = cls(self.hostname, self.port, timeout=self.timeout)
+            self._conn._create_connection = self._connect_resolved
+        if not reused:
             self.connection_rebuilds += 1
-        return self._conn, reused, dns_ms
+        return self._conn, reused
 
-    def _request_text_persistent(
+    def request_bytes(
         self,
         method: str,
         path: str,
         body: str | bytes | None = None,
         query: dict[str, Any] | None = None,
-    ) -> tuple[int, str, float]:
-        """处理 scripts/long_run_test.py 中的 request text persistent 逻辑。
-
-        该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
-        在实现变化时与项目文档同步维护。
-        """
+        max_bytes: int | None = None,
+    ) -> tuple[int, bytes, float]:
+        """Use the same direct connection and resolver for JSON and binary files."""
+        if self.scheme not in {"http", "https"}:
+            raise ValueError("HTTP test host must use http or https")
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if not self.persistent:
+            self.close()
         data = None
-        headers = {"User-Agent": "cclaw-long-run-test/1.0", "Connection": "keep-alive"}
+        headers = {"User-Agent": "cclaw-long-run-test/1.0", "Connection": "keep-alive" if self.persistent else "close"}
         if body is not None:
             data = body.encode("utf-8") if isinstance(body, str) else body
             headers["Content-Type"] = "text/plain; charset=utf-8"
         start = time.monotonic()
-        dns_ms: float | None = None
         reused = False
         request_ms: float | None = None
         read_ms: float | None = None
+        self.last_timing = {"persistent": self.persistent, "dns_ms": None,
+                            "dns_cache_hit": False, "dns_lookup_failures": 0}
         try:
-            conn, reused, dns_ms = self._ensure_conn()
+            conn, reused = self._ensure_conn()
             request_started = time.monotonic()
             conn.request(method, self._path(path, query), body=data, headers=headers)
             resp = conn.getresponse()
             request_ms = (time.monotonic() - request_started) * 1000.0
             read_started = time.monotonic()
-            text = resp.read().decode("utf-8", errors="replace")
+            content = resp.read() if max_bytes is None else resp.read(max_bytes + 1)
             read_ms = (time.monotonic() - read_started) * 1000.0
-            return resp.status, text, time.monotonic() - start
+            if max_bytes is not None and len(content) > max_bytes:
+                raise ValueError(f"HTTP response exceeds {max_bytes} bytes")
+            if resp.length:
+                raise http.client.IncompleteRead(content, resp.length)
+            return resp.status, content, time.monotonic() - start
         except Exception:
             self.close()
             raise
         finally:
-            self.last_timing = {
-                "persistent": True,
+            self.last_timing.update({
                 "connection_reused": reused,
                 "connection_rebuilds": self.connection_rebuilds,
-                "dns_ms": None if dns_ms is None else round(dns_ms, 3),
                 "request_ms": None if request_ms is None else round(request_ms, 3),
                 "read_ms": None if read_ms is None else round(read_ms, 3),
-            }
-
-    def _request_text_urllib(
-        self,
-        method: str,
-        path: str,
-        body: str | bytes | None = None,
-        query: dict[str, Any] | None = None,
-    ) -> tuple[int, str, float]:
-        """处理 scripts/long_run_test.py 中的 request text urllib 逻辑。
-
-        该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
-        在实现变化时与项目文档同步维护。
-        """
-        data = None
-        headers = {"User-Agent": "cclaw-long-run-test/1.0"}
-        if body is not None:
-            data = body.encode("utf-8") if isinstance(body, str) else body
-            headers["Content-Type"] = "text/plain; charset=utf-8"
-        req = request.Request(self._url(path, query), data=data, headers=headers, method=method)
-        start = time.monotonic()
-        self.last_timing = {"persistent": False}
-        try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
-                read_started = time.monotonic()
-                text = resp.read().decode("utf-8", errors="replace")
-                self.last_timing["read_ms"] = round((time.monotonic() - read_started) * 1000.0, 3)
-                return resp.getcode(), text, time.monotonic() - start
-        except error.HTTPError as exc:
-            read_started = time.monotonic()
-            text = exc.read().decode("utf-8", errors="replace")
-            self.last_timing["read_ms"] = round((time.monotonic() - read_started) * 1000.0, 3)
-            return exc.code, text, time.monotonic() - start
+            })
+            if not self.persistent:
+                self.close()
 
     def request_text(
         self,
@@ -531,9 +647,8 @@ class HttpClient:
         该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
         在实现变化时与项目文档同步维护。
         """
-        if self.persistent and self.scheme in {"http", "https"}:
-            return self._request_text_persistent(method, path, body, query)
-        return self._request_text_urllib(method, path, body, query)
+        code, content, elapsed = self.request_bytes(method, path, body, query)
+        return code, content.decode("utf-8", errors="replace"), elapsed
 
     def get_json(self, path: str, query: dict[str, Any] | None = None) -> tuple[dict[str, Any], float]:
         """处理 scripts/long_run_test.py 中的 get json 逻辑。
@@ -792,6 +907,13 @@ class SerialWorker:
 
 @dataclass
 class Summary:
+    stress: bool = False
+    stress_status_samples: int = 0
+    stress_commands: int = 0
+    event_cursor_resets: int = 0
+    event_gap_payloads: int = 0
+    event_truncated_payloads: int = 0
+    event_omitted: int = 0
     run_id: str | None = None
     run_label: str | None = None
     output_dir: str | None = None
@@ -815,6 +937,7 @@ class Summary:
     serial_writes: int = 0
     serial_write_failures: int = 0
     serial_errors: int = 0
+    task_watchdog_warnings: int = 0
     events_seen: int = 0
     event_duplicate_seq: int = 0
     event_backward_seq: int = 0
@@ -864,18 +987,39 @@ class Summary:
     profile_phase_max_us: dict[str, float] = field(default_factory=dict)
     profile_cpu_available_samples: int = 0
     profile_cpu_unavailable_samples: int = 0
+    profile_cpu_valid_samples: int = 0
+    profile_cpu_invalid_samples: int = 0
+    profile_cpu_legacy_samples: int = 0
+    profile_cpu_invalid_value_count: int = 0
+    profile_cpu_truncated_samples: int = 0
+    profile_cpu_unknown_core_task_samples: int = 0
+    profile_cpu_task_id_missing: int = 0
+    profile_cpu_idle_unavailable_samples: int = 0
     profile_cpu_task_samples: dict[str, int] = field(default_factory=dict)
+    profile_cpu_task_names: dict[str, str] = field(default_factory=dict)
+    profile_cpu_task_ids: dict[str, int | None] = field(default_factory=dict)
     profile_cpu_task_total_pct: dict[str, float] = field(default_factory=dict)
     profile_cpu_task_max_pct: dict[str, float] = field(default_factory=dict)
     profile_cpu_task_last_pct: dict[str, float] = field(default_factory=dict)
+    profile_cpu_task_weight_ms: dict[str, float] = field(default_factory=dict)
+    profile_cpu_task_weighted_pct: dict[str, float] = field(default_factory=dict)
     profile_cpu_total_samples: int = 0
     profile_cpu_total_sum_pct: float = 0.0
+    profile_cpu_total_weight_ms: float = 0.0
+    profile_cpu_total_weighted_pct: float = 0.0
     profile_cpu_total_max_pct: float = 0.0
     profile_cpu_total_last_pct: float | None = None
     profile_cpu_core_samples: dict[str, int] = field(default_factory=dict)
     profile_cpu_core_total_pct: dict[str, float] = field(default_factory=dict)
+    profile_cpu_core_weight_ms: dict[str, float] = field(default_factory=dict)
+    profile_cpu_core_weighted_pct: dict[str, float] = field(default_factory=dict)
     profile_cpu_core_max_pct: dict[str, float] = field(default_factory=dict)
     profile_cpu_core_last_pct: dict[str, float] = field(default_factory=dict)
+    profile_cpu_duplicate_samples: int = 0
+    profile_cpu_idle_missing_samples: dict[str, int] = field(default_factory=dict)
+    profile_cpu_idle_low_samples: dict[str, int] = field(default_factory=dict)
+    profile_cpu_idle_low_streak: dict[str, int] = field(default_factory=dict)
+    profile_cpu_idle_low_max_streak: dict[str, int] = field(default_factory=dict)
     profile_expected_level: str | None = None
     profile_expected_interval_ms: int | None = None
     profile_mismatch_count: int = 0
@@ -914,6 +1058,12 @@ class Summary:
     long_failure_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     _seen_event_seqs: set[int] = field(default_factory=set, repr=False)
     _last_event_seq_observed: int | None = field(default=None, repr=False)
+    # sample_seq identifies the CPU window. The enclosing profile event has a
+    # fresh timestamp even when it reuses the cached CPU JSON, so timestamp
+    # must not be part of the deduplication key.
+    _seen_cpu_sample_keys: set[int] = field(default_factory=set, repr=False)
+    _last_cpu_sample_seq: int | None = field(default=None, repr=False)
+    _last_cpu_timestamp_ms: int | None = field(default=None, repr=False)
 
     def observe_status(self, status: dict[str, Any], previous_uptime_ms: int | None) -> int | None:
         """处理 scripts/long_run_test.py 中的 observe status 逻辑。
@@ -922,8 +1072,13 @@ class Summary:
         在实现变化时与项目文档同步维护。
         """
         uptime = safe_int(status.get("uptime_ms"), -1)
-        if previous_uptime_ms is not None and uptime >= 0 and uptime + 5000 < previous_uptime_ms:
+        rebooted = previous_uptime_ms is not None and uptime >= 0 and uptime + 5000 < previous_uptime_ms
+        if rebooted:
             self.reboots_observed += 1
+            self._seen_cpu_sample_keys.clear()
+            self._last_cpu_sample_seq = None
+            self._last_cpu_timestamp_ms = None
+            self.profile_cpu_idle_low_streak.clear()
         heap = status.get("heap") if isinstance(status.get("heap"), dict) else {}
         internal = safe_int(heap.get("internal_free"), -1)
         psram = safe_int(heap.get("psram_free"), -1)
@@ -939,6 +1094,7 @@ class Summary:
         if oldest_seq >= 0:
             self.min_events_oldest_seq = oldest_seq if self.min_events_oldest_seq is None else min(self.min_events_oldest_seq, oldest_seq)
         self.max_events_capacity = max(self.max_events_capacity, safe_int(events.get("capacity"), 0))
+        return uptime if uptime >= 0 else previous_uptime_ms
 
     def observe_ota_status(self, status: dict[str, Any]) -> None:
         """处理 scripts/long_run_test.py 中的 observe ota status 逻辑。
@@ -1057,6 +1213,8 @@ class Summary:
         该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
         在实现变化时与项目文档同步维护。
         """
+        if "task_wdt: Task watchdog got triggered" in (line or ""):
+            self.task_watchdog_warnings += 1
         if "HTTP attempt failed" not in (line or ""):
             return
         self.serial_http_attempt_failed += 1
@@ -1087,6 +1245,13 @@ class Summary:
         该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
         在实现变化时与项目文档同步维护。
         """
+        if payload.get("cursor_reset") is True:
+            self.event_cursor_resets += 1
+            self._seen_event_seqs.clear()
+            self._last_event_seq_observed = None
+        self.event_gap_payloads += int(payload.get("gap") is True)
+        self.event_truncated_payloads += int(payload.get("truncated") is True)
+        self.event_omitted += safe_int(payload.get("omitted"))
         self.event_latest_seq_reported = max(self.event_latest_seq_reported, safe_int(payload.get("latest_seq"), 0))
         self.max_events_dropped = max(self.max_events_dropped, safe_int(payload.get("dropped"), 0))
         self.max_events_ring_overwrites = max(self.max_events_ring_overwrites, safe_int(payload.get("ring_overwrites"), 0))
@@ -1249,70 +1414,185 @@ class Summary:
 
         cpu = payload.get("cpu") if isinstance(payload.get("cpu"), dict) else {}
         if cpu:
-            if cpu.get("available") is True:
+            raw_sample_seq = cpu.get("sample_seq")
+            sample_seq = (
+                safe_int(raw_sample_seq, -1)
+                if raw_sample_seq is not None and not isinstance(raw_sample_seq, bool)
+                else -1
+            )
+            if sample_seq > 0:
+                sample_timestamp = safe_int(payload.get("timestamp_ms"), -1)
+                # A reset starts both counters over. Drop the old boot's
+                # window ids before accepting the new sequence.
+                if ((self._last_cpu_sample_seq is not None and
+                     sample_seq < self._last_cpu_sample_seq) or
+                    (self._last_cpu_timestamp_ms is not None and
+                     sample_timestamp >= 0 and
+                     sample_timestamp < self._last_cpu_timestamp_ms)):
+                    self._seen_cpu_sample_keys.clear()
+                if sample_seq in self._seen_cpu_sample_keys:
+                    self.profile_cpu_duplicate_samples += 1
+                    return
+                self._seen_cpu_sample_keys.add(sample_seq)
+                self._last_cpu_sample_seq = sample_seq
+                if sample_timestamp >= 0:
+                    self._last_cpu_timestamp_ms = sample_timestamp
+            available = cpu.get("available") is True
+            if available:
                 self.profile_cpu_available_samples += 1
             else:
                 self.profile_cpu_unavailable_samples += 1
-            tasks = cpu.get("tasks") if isinstance(cpu.get("tasks"), list) else []
-            idle_pct_values: list[float] = []
-            idle_pct_by_core: dict[int, float] = {}
-            for task in tasks:
-                if not isinstance(task, dict):
-                    continue
-                name = str(task.get("name") or task.get("n") or "unknown")
-                pct = task.get("core_pct")
-                if pct is None:
-                    pct = task.get("cp")
-                if pct is None:
-                    pct = task.get("cpu_pct")
-                if pct is None:
-                    pct = task.get("p")
-                if not isinstance(pct, (int, float)):
-                    continue
-                value = float(pct)
-                self.profile_cpu_task_samples[name] = self.profile_cpu_task_samples.get(name, 0) + 1
-                self.profile_cpu_task_total_pct[name] = self.profile_cpu_task_total_pct.get(name, 0.0) + value
-                self.profile_cpu_task_max_pct[name] = max(self.profile_cpu_task_max_pct.get(name, 0.0), value)
-                self.profile_cpu_task_last_pct[name] = value
-                core = task.get("core")
-                if core is None:
-                    core = task.get("c")
-                if name.upper().startswith("IDLE"):
-                    idle_pct_values.append(value)
-                    if isinstance(core, int) and core >= 0:
-                        idle_pct_by_core[core] = value
-                    elif name[-1:].isdigit():
-                        idle_pct_by_core[int(name[-1])] = value
+            if available and ("valid" not in cpu or "window_ms" not in cpu):
+                self.profile_cpu_legacy_samples += 1
+            if cpu.get("truncated") is True:
+                self.profile_cpu_truncated_samples += 1
+            if not cpu_frame_is_valid(cpu, payload):
+                if available:
+                    self.profile_cpu_invalid_samples += 1
+                    if cpu.get("reason") == "core_idle_missing":
+                        self.profile_cpu_idle_unavailable_samples += 1
+                return
+            self.profile_cpu_valid_samples += 1
+            self._observe_cpu_idle_quality(cpu)
+            raw_window_ms = cpu.get("window_ms")
+            window_ms = float(raw_window_ms) if isinstance(raw_window_ms, (int, float)) else 0.0
+            if not math.isfinite(window_ms) or window_ms <= 0.0:
+                # cpu_frame_is_valid 已经拦截该情况；这里仅保留防御性保护。
+                window_ms = 1.0
+
+            core_values: dict[str, float] = {}
             core_pct = cpu.get("core_pct")
             if isinstance(core_pct, list):
                 for index, pct_value in enumerate(core_pct):
-                    if isinstance(pct_value, (int, float)):
-                        self._observe_cpu_core_pct(str(index), float(pct_value))
-            elif idle_pct_by_core:
-                for core_id, idle_value in idle_pct_by_core.items():
-                    self._observe_cpu_core_pct(str(core_id), 100.0 - idle_value)
-            total_pct = cpu.get("total_pct")
-            if not isinstance(total_pct, (int, float)) and idle_pct_values:
-                cores = cpu.get("cores")
-                if not isinstance(cores, (int, float)) or cores <= 0:
-                    cores = max(1, len(idle_pct_values))
-                total_pct = 100.0 - (sum(idle_pct_values) / float(cores))
-            if isinstance(total_pct, (int, float)):
-                total_value = max(0.0, min(100.0, float(total_pct)))
+                    if pct_value is None:
+                        continue
+                    value = valid_percentage(pct_value)
+                    if value is None:
+                        self.profile_cpu_invalid_value_count += 1
+                        continue
+                    core_values[str(index)] = value
+            for core, value in core_values.items():
+                self._observe_cpu_core_pct(core, value, window_ms)
+
+            total_value = valid_percentage(cpu.get("total_pct"))
+            if total_value is None:
+                if cpu.get("total_pct") is not None:
+                    self.profile_cpu_invalid_value_count += 1
+                if core_values:
+                    total_value = sum(core_values.values()) / len(core_values)
+            if total_value is not None:
                 self.profile_cpu_total_samples += 1
                 self.profile_cpu_total_sum_pct += total_value
+                self.profile_cpu_total_weight_ms += window_ms
+                self.profile_cpu_total_weighted_pct += total_value * window_ms
                 self.profile_cpu_total_max_pct = max(self.profile_cpu_total_max_pct, total_value)
                 self.profile_cpu_total_last_pct = total_value
 
-    def _observe_cpu_core_pct(self, core: str, value: float) -> None:
+            tasks = cpu.get("tasks") if isinstance(cpu.get("tasks"), list) else []
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                task_key, task_id, name = cpu_task_identity(task)
+                pct = task.get("cpu_pct")
+                if pct is None:
+                    pct = task.get("p")
+                core_pct_value = task.get("core_pct")
+                if core_pct_value is None:
+                    core_pct_value = task.get("core_p")
+                if core_pct_value is not None and valid_percentage(core_pct_value) is None:
+                    self.profile_cpu_invalid_value_count += 1
+                value = valid_percentage(pct)
+                if value is None:
+                    if pct is not None:
+                        self.profile_cpu_invalid_value_count += 1
+                    continue
+                self.profile_cpu_task_names[task_key] = name
+                self.profile_cpu_task_ids[task_key] = task_id
+                if task_id is None:
+                    self.profile_cpu_task_id_missing += 1
+                self.profile_cpu_task_samples[task_key] = self.profile_cpu_task_samples.get(task_key, 0) + 1
+                self.profile_cpu_task_total_pct[task_key] = self.profile_cpu_task_total_pct.get(task_key, 0.0) + value
+                self.profile_cpu_task_weight_ms[task_key] = self.profile_cpu_task_weight_ms.get(task_key, 0.0) + window_ms
+                self.profile_cpu_task_weighted_pct[task_key] = (
+                    self.profile_cpu_task_weighted_pct.get(task_key, 0.0) + value * window_ms
+                )
+                self.profile_cpu_task_max_pct[task_key] = max(self.profile_cpu_task_max_pct.get(task_key, 0.0), value)
+                self.profile_cpu_task_last_pct[task_key] = value
+                raw_core = task.get("core") if "core" in task else task.get("c")
+                core_id = None
+                if raw_core is not None and not isinstance(raw_core, bool):
+                    candidate = safe_int(raw_core, -1)
+                    if candidate >= 0:
+                        core_id = candidate
+                if core_id is None and name.upper().startswith("IDLE") and name[-1:].isdigit():
+                    core_id = int(name[-1])
+                if core_id is None:
+                    self.profile_cpu_unknown_core_task_samples += 1
+
+    def _observe_cpu_idle_quality(self, cpu: dict[str, Any]) -> None:
+        """Track per-core IDLE starvation evidence for valid CPU windows.
+
+        New firmware reports ``core_idle_pct`` explicitly. Older valid-shaped
+        fixtures only have busy ``core_pct`` values, so derive idle as
+        ``100 - busy`` for those rows. Missing or malformed values remain
+        separate from a measured zero-idle window.
+        """
+        raw_idle = cpu.get("core_idle_pct")
+        raw_busy = cpu.get("core_pct")
+        expected = safe_int(cpu.get("cores"), 0)
+        lengths = [len(value) for value in (raw_idle, raw_busy) if isinstance(value, list)]
+        if expected <= 0:
+            expected = max(lengths, default=0)
+        for index in range(expected):
+            key = str(index)
+            idle = None
+            idle_slot_present = isinstance(raw_idle, list) and index < len(raw_idle)
+            if idle_slot_present and raw_idle[index] is not None:
+                idle = valid_percentage(raw_idle[index])
+                if idle is None:
+                    self.profile_cpu_invalid_value_count += 1
+            elif not idle_slot_present or raw_idle[index] is None:
+                busy = raw_busy[index] if isinstance(raw_busy, list) and index < len(raw_busy) else None
+                busy_value = valid_percentage(busy)
+                if busy_value is not None:
+                    idle = 100.0 - busy_value
+                elif busy is not None:
+                    self.profile_cpu_invalid_value_count += 1
+            if idle is None:
+                self.profile_cpu_idle_missing_samples[key] = (
+                    self.profile_cpu_idle_missing_samples.get(key, 0) + 1
+                )
+                self.profile_cpu_idle_low_streak[key] = 0
+                continue
+            if idle <= CPU_IDLE_STARVATION_THRESHOLD_PCT:
+                self.profile_cpu_idle_low_samples[key] = (
+                    self.profile_cpu_idle_low_samples.get(key, 0) + 1
+                )
+                streak = self.profile_cpu_idle_low_streak.get(key, 0) + 1
+                self.profile_cpu_idle_low_streak[key] = streak
+                self.profile_cpu_idle_low_max_streak[key] = max(
+                    self.profile_cpu_idle_low_max_streak.get(key, 0), streak
+                )
+            else:
+                self.profile_cpu_idle_low_streak[key] = 0
+
+    def _observe_cpu_core_pct(self, core: str, value: float, window_ms: float = 1.0) -> None:
         """处理 scripts/long_run_test.py 中的 observe cpu core pct 逻辑。
 
         该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
         在实现变化时与项目文档同步维护。
         """
-        total_value = max(0.0, min(100.0, float(value)))
+        total_value = valid_percentage(value)
+        if total_value is None:
+            self.profile_cpu_invalid_value_count += 1
+            return
+        weight_ms = max(1.0, float(window_ms))
         self.profile_cpu_core_samples[core] = self.profile_cpu_core_samples.get(core, 0) + 1
         self.profile_cpu_core_total_pct[core] = self.profile_cpu_core_total_pct.get(core, 0.0) + total_value
+        self.profile_cpu_core_weight_ms[core] = self.profile_cpu_core_weight_ms.get(core, 0.0) + weight_ms
+        self.profile_cpu_core_weighted_pct[core] = (
+            self.profile_cpu_core_weighted_pct.get(core, 0.0) + total_value * weight_ms
+        )
         self.profile_cpu_core_max_pct[core] = max(self.profile_cpu_core_max_pct.get(core, 0.0), total_value)
         self.profile_cpu_core_last_pct[core] = total_value
 
@@ -1363,37 +1643,79 @@ class Summary:
         data["first_thinking_summary_ms"] = latency_summary(self.first_thinking_samples_ms)
         data["first_token_summary_ms"] = latency_summary(self.first_token_samples_ms)
         data["total_elapsed_summary_ms"] = latency_summary(self.total_elapsed_samples_ms)
-        data["profile_cpu_tasks"] = {
-            name: {
-                "samples": self.profile_cpu_task_samples.get(name, 0),
-                "avg_pct": round(
-                    self.profile_cpu_task_total_pct.get(name, 0.0) /
-                    max(1, self.profile_cpu_task_samples.get(name, 0)),
-                    2,
-                ),
-                "max_pct": round(self.profile_cpu_task_max_pct.get(name, 0.0), 2),
-                "last_pct": round(self.profile_cpu_task_last_pct.get(name, 0.0), 2),
+        cpu_task_stats: dict[str, dict[str, Any]] = {}
+        for task_key in sorted(self.profile_cpu_task_samples):
+            samples = self.profile_cpu_task_samples.get(task_key, 0)
+            weight_ms = self.profile_cpu_task_weight_ms.get(task_key, 0.0)
+            average = (
+                self.profile_cpu_task_weighted_pct.get(task_key, 0.0) / weight_ms
+                if weight_ms > 0.0
+                else self.profile_cpu_task_total_pct.get(task_key, 0.0) / max(1, samples)
+            )
+            cpu_task_stats[task_key] = {
+                "task_id": self.profile_cpu_task_ids.get(task_key),
+                "name": self.profile_cpu_task_names.get(task_key, task_key),
+                "samples": samples,
+                "weight_ms": round(weight_ms, 2),
+                "avg_pct": round(average, 2),
+                "max_pct": round(self.profile_cpu_task_max_pct.get(task_key, 0.0), 2),
+                "last_pct": round(self.profile_cpu_task_last_pct.get(task_key, 0.0), 2),
             }
-            for name in sorted(self.profile_cpu_task_samples)
-        }
+        data["profile_cpu_tasks"] = cpu_task_stats
+        total_average = (
+            self.profile_cpu_total_weighted_pct / self.profile_cpu_total_weight_ms
+            if self.profile_cpu_total_weight_ms > 0.0
+            else (
+                self.profile_cpu_total_sum_pct / self.profile_cpu_total_samples
+                if self.profile_cpu_total_samples > 0 else None
+            )
+        )
         data["profile_cpu_total"] = {
             "samples": self.profile_cpu_total_samples,
-            "avg_pct": round(self.profile_cpu_total_sum_pct / max(1, self.profile_cpu_total_samples), 2),
+            "weight_ms": round(self.profile_cpu_total_weight_ms, 2),
+            "avg_pct": None if total_average is None else round(total_average, 2),
             "max_pct": round(self.profile_cpu_total_max_pct, 2),
             "last_pct": None if self.profile_cpu_total_last_pct is None else round(self.profile_cpu_total_last_pct, 2),
         }
-        data["profile_cpu_cores"] = {
-            core: {
-                "samples": self.profile_cpu_core_samples.get(core, 0),
-                "avg_pct": round(self.profile_cpu_core_total_pct.get(core, 0.0) / max(1, self.profile_cpu_core_samples.get(core, 0)), 2),
+        data["profile_cpu_cores"] = {}
+        for core in sorted(self.profile_cpu_core_samples):
+            samples = self.profile_cpu_core_samples.get(core, 0)
+            weight_ms = self.profile_cpu_core_weight_ms.get(core, 0.0)
+            average = (
+                self.profile_cpu_core_weighted_pct.get(core, 0.0) / weight_ms
+                if weight_ms > 0.0
+                else self.profile_cpu_core_total_pct.get(core, 0.0) / max(1, samples)
+            )
+            data["profile_cpu_cores"][core] = {
+                "samples": samples,
+                "weight_ms": round(weight_ms, 2),
+                "avg_pct": round(average, 2),
                 "max_pct": round(self.profile_cpu_core_max_pct.get(core, 0.0), 2),
                 "last_pct": round(self.profile_cpu_core_last_pct.get(core, 0.0), 2),
             }
-            for core in sorted(self.profile_cpu_core_samples)
+        data["profile_cpu_quality"] = {
+            "available_samples": self.profile_cpu_available_samples,
+            "valid_samples": self.profile_cpu_valid_samples,
+            "invalid_samples": self.profile_cpu_invalid_samples,
+            "legacy_samples": self.profile_cpu_legacy_samples,
+            "invalid_value_count": self.profile_cpu_invalid_value_count,
+            "truncated_samples": self.profile_cpu_truncated_samples,
+            "unknown_core_task_samples": self.profile_cpu_unknown_core_task_samples,
+            "duplicate_samples": self.profile_cpu_duplicate_samples,
+            "task_id_missing": self.profile_cpu_task_id_missing,
+            "idle_unavailable_samples": self.profile_cpu_idle_unavailable_samples,
+            "idle_starvation_threshold_pct": CPU_IDLE_STARVATION_THRESHOLD_PCT,
+            "idle_missing_samples": dict(sorted(self.profile_cpu_idle_missing_samples.items())),
+            "idle_low_samples": dict(sorted(self.profile_cpu_idle_low_samples.items())),
+            "idle_low_streak": dict(sorted(self.profile_cpu_idle_low_streak.items())),
+            "idle_low_max_streak": dict(sorted(self.profile_cpu_idle_low_max_streak.items())),
         }
         data["unique_event_seqs"] = len(self._seen_event_seqs)
         data.pop("_seen_event_seqs", None)
         data.pop("_last_event_seq_observed", None)
+        data.pop("_seen_cpu_sample_keys", None)
+        data.pop("_last_cpu_sample_seq", None)
+        data.pop("_last_cpu_timestamp_ms", None)
         return data
 
 
@@ -1488,7 +1810,7 @@ def make_long_conversation(turns: int) -> list[dict[str, Any]]:
             "expect": [task_id],
         },
         {
-            "prompt": "现在把之前的检查流程改成更适合 6 小时烧机的版本，要求提到关键参数和错误恢复。",
+            "prompt": "现在把之前的检查流程改成更适合持续压力测试的版本，要求提到关键参数和错误恢复。",
             "expect": [param],
         },
         {
@@ -1507,70 +1829,6 @@ def make_long_conversation(turns: int) -> list[dict[str, Any]]:
         extra.append(
             {
                 "prompt": f"继续第 {idx + 1} 个扩展追问：结合前文说明一个额外风险和一个观测指标，引用 {task_id}。",
-                "expect": [task_id],
-            }
-        )
-    return base + extra
-
-
-def make_long_conversation(turns: int) -> list[dict[str, Any]]:
-    """处理 scripts/long_run_test.py 中的 make long conversation 逻辑。
-
-    该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
-    在实现变化时与项目文档同步维护。
-    """
-    turns = max(3, min(20, turns))
-    task_id = f"LR-{random.randint(1000, 9999)}"
-    device_name = "C-Claw-COM6"
-    param = f"P{random.randint(20, 89)}"
-    base = [
-        {
-            "prompt": (
-                f"开始一个长对话稳定性测试。请记住：任务编号是 {task_id}，设备名是 {device_name}，"
-                f"关键参数是 {param}。先确认你已记住这些信息，并用中文回答。"
-            ),
-            "expect": [task_id, device_name, param],
-        },
-        {
-            "prompt": "现在请设计一个三步检查流程，依次检查网络状态、串口命令和 USB 日志。回答要引用刚才的任务编号。",
-            "expect": [task_id],
-        },
-        {
-            "prompt": f"把关键参数 {param} 用到检查流程里：假设它是采样批次号，请说明每一步如何记录它。",
-            "expect": [param],
-        },
-        {
-            "prompt": "中间插入一个上下文检查：请复述设备名、任务编号、关键参数，并说明目前流程的目标。",
-            "expect": [task_id, device_name, param],
-        },
-        {
-            "prompt": (
-                "下面是一段较长约束：长测不能频繁重启设备，不能覆盖 USB 配置文件，"
-                "需要保留串口原始日志、Web 事件日志、每轮状态快照，并且长对话失败也要继续后续测试。"
-                "请提取这些约束，并继续沿用前面的任务编号。"
-            ),
-            "expect": [task_id],
-        },
-        {
-            "prompt": "现在把之前的检查流程改成更适合 6 小时烧机的版本，要求提到关键参数和错误恢复。",
-            "expect": [param],
-        },
-        {
-            "prompt": "请假设刚刚发生了一次 Wi-Fi 短暂断连，说明测试脚本应如何记录并恢复，仍然引用任务编号。",
-            "expect": [task_id],
-        },
-        {
-            "prompt": "最终总结整个长对话测试结论，必须包含设备名、任务编号和关键参数。",
-            "expect": [task_id, device_name, param],
-        },
-    ]
-    if turns <= len(base):
-        return base[:turns]
-    extra: list[dict[str, Any]] = []
-    for idx in range(turns - len(base)):
-        extra.append(
-            {
-                "prompt": f"继续第 {idx + 1} 个扩展追问：结合前文说明一个额外风险和一个观测指标，并引用 {task_id}。",
                 "expect": [task_id],
             }
         )
@@ -1714,16 +1972,24 @@ def _partial_cpu_tasks(text: str) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     patterns = [
         re.compile(r'\{"name":"(?P<name>[^"]+)".*?"cpu_pct":(?P<pct>[0-9]+(?:\.[0-9]+)?)'),
-        re.compile(r'\{"n":"(?P<name>[^"]+)".*?"p":(?P<pct>[0-9]+(?:\.[0-9]+)?)'),
+        re.compile(r'\{(?:"(?:id|task_id)":-?\d+,)?"n":"(?P<name>[^"]+)".*?"p":(?P<pct>[0-9]+(?:\.[0-9]+)?)'),
     ]
     for pattern in patterns:
         for match in pattern.finditer(text):
             try:
                 raw = match.group(0)
                 task = {"n": match.group("name"), "p": float(match.group("pct"))}
+                task_id = _regex_json_int(raw, "id")
+                if task_id is None:
+                    task_id = _regex_json_int(raw, "task_id")
+                if task_id is not None:
+                    task["id"] = task_id
                 core = _regex_json_int(raw, "c")
                 if core is not None:
                     task["c"] = core
+                core_p_match = re.search(r'"core_p"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
+                if core_p_match:
+                    task["core_p"] = float(core_p_match.group(1))
                 cp_match = re.search(r'"cp"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
                 if cp_match:
                     task["cp"] = float(cp_match.group(1))
@@ -1747,6 +2013,35 @@ def parse_profile_event_text(text: str) -> tuple[dict[str, Any] | None, bool]:
 
     if not text.startswith("{"):
         return None, True
+    # Recover only fully decoded top-level values before a truncated tail.
+    # Tool/HTTP attributes precede the large heap/cpu sections and often remain
+    # intact. Regex extraction alone discards these execution facts.
+    prefix: dict[str, Any] = {}
+    decoder = json.JSONDecoder()
+    position = 1
+    try:
+        while position < len(text):
+            while position < len(text) and text[position].isspace():
+                position += 1
+            key, position = decoder.raw_decode(text, position)
+            if not isinstance(key, str):
+                break
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] != ":":
+                break
+            position += 1
+            while position < len(text) and text[position].isspace():
+                position += 1
+            value, position = decoder.raw_decode(text, position)
+            prefix[key] = value
+            while position < len(text) and text[position].isspace():
+                position += 1
+            if position >= len(text) or text[position] != ",":
+                break
+            position += 1
+    except json.JSONDecodeError:
+        pass
     phase = _regex_json_string(text, "phase") or _regex_json_string(text, "sdk_event")
     event = _regex_json_string(text, "event")
     if not phase and not event and "\"cpu\"" not in text:
@@ -1776,6 +2071,10 @@ def parse_profile_event_text(text: str) -> tuple[dict[str, Any] | None, bool]:
         if saw_body is not None:
             attrs["saw_body"] = saw_body
         payload["attributes"] = attrs
+    if isinstance(prefix.get("attributes"), dict):
+        payload["attributes"] = prefix["attributes"]
+    if isinstance(prefix.get("error"), dict):
+        payload["error"] = prefix["error"]
     heap: dict[str, Any] = {}
     for key in ("internal_free", "internal_total", "internal_largest", "psram_free", "psram_total", "psram_largest", "free", "min_free"):
         value = _regex_json_int(text, key)
@@ -1784,15 +2083,33 @@ def parse_profile_event_text(text: str) -> tuple[dict[str, Any] | None, bool]:
     if heap:
         payload["heap"] = heap
     tasks = _partial_cpu_tasks(text)
-    if tasks or "\"cpu\"" in text:
+    total_pct_match = re.search(r'"total_pct"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)', text)
+    core_pct_match = re.search(r'"core_pct"\s*:\s*\[([^\]]*)', text)
+    if tasks or total_pct_match or core_pct_match:
         cpu: dict[str, Any] = {"available": True, "tasks": tasks}
-        total_pct_match = re.search(r'"total_pct"\s*:\s*([0-9]+(?:\.[0-9]+)?)', text)
         if total_pct_match:
             cpu["total_pct"] = float(total_pct_match.group(1))
+        available = _regex_json_bool(text, "available")
+        if available is not None:
+            cpu["available"] = available
+        valid = _regex_json_bool(text, "valid")
+        if valid is not None:
+            cpu["valid"] = valid
+        runtime_stats = _regex_json_bool(text, "runtime_stats")
+        if runtime_stats is not None:
+            cpu["runtime_stats"] = runtime_stats
+        window_ms = _regex_json_int(text, "window_ms")
+        if window_ms is not None:
+            cpu["window_ms"] = window_ms
+        task_count = _regex_json_int(text, "task_count")
+        if task_count is not None:
+            cpu["task_count"] = task_count
+        truncated = _regex_json_bool(text, "truncated")
+        if truncated is not None:
+            cpu["truncated"] = truncated
         cores = _regex_json_int(text, "cores")
         if cores is not None:
             cpu["cores"] = cores
-        core_pct_match = re.search(r'"core_pct"\s*:\s*\[([^\]]*)', text)
         if core_pct_match:
             values: list[float] = []
             for part in core_pct_match.group(1).split(","):
@@ -1885,9 +2202,17 @@ def wait_for_message_events(
     saw_response = False
     saw_completion = False
     while time.monotonic() < deadline:
+        poll_checkpoint(http)
         payload, _elapsed = http.get_json("/api/events", {"since": latest_seq, "limit": event_limit})
         observe_http_success(summary, "events", _elapsed, http)
         summary.observe_events_payload(payload)
+        if payload.get("cursor_reset") is True:
+            events_writer.write({"ts": utc_now(), "event_cursor_reset": True, "previous_seq": latest_seq})
+            timing["last_runtime_error"] = "device event cursor reset during conversation"
+            timing["error_event_count"] = 1
+            return collected, 0, False, timing
+        if payload.get("gap") or payload.get("truncated"):
+            timing["log_incomplete"] = True
         batch = payload.get("events") if isinstance(payload.get("events"), list) else []
         batch_had_response = False
         for item in batch:
@@ -1934,12 +2259,12 @@ def wait_for_message_events(
                         batch_had_response = True
                     if saw_run_start and is_completion_event(item):
                         saw_completion = True
-        latest_seq = max(latest_seq, safe_int(payload.get("latest_seq"), latest_seq))
+        latest_seq = event_cursor(payload, latest_seq)
         if batch_had_response:
             saw_response = True
         if saw_completion and saw_response:
             break
-        time.sleep(poll_interval)
+        poll_sleep(http, poll_interval)
     timing["assistant_event_count"] = assistant_event_count
     timing["assistant_text_chars"] = assistant_text_chars
     timing["thinking_event_count"] = thinking_event_count
@@ -1947,8 +2272,8 @@ def wait_for_message_events(
     timing["error_event_count"] = error_event_count
     timing["last_runtime_error"] = last_runtime_error
     timing["total_elapsed_ms"] = round((time.monotonic() - started) * 1000, 2)
-    timing["log_incomplete"] = safe_int(timing.get("assistant_text_chars"), 0) == 0 and saw_response
-    return collected, latest_seq, saw_response and saw_completion, timing
+    timing["log_incomplete"] = bool(timing.get("log_incomplete")) or (assistant_text_chars == 0 and saw_response)
+    return collected, latest_seq, saw_response and saw_completion and not timing["log_incomplete"], timing
 
 
 def wait_for_interaction_idle(
@@ -1970,6 +2295,7 @@ def wait_for_interaction_idle(
     last_status: dict[str, Any] | None = None
     seq = latest_seq
     while time.monotonic() < deadline:
+        poll_checkpoint(http)
         try:
             status, _elapsed = http.get_json("/api/status")
             observe_http_success(summary, "status", _elapsed, http)
@@ -1985,6 +2311,8 @@ def wait_for_interaction_idle(
                 payload, _elapsed = http.get_json("/api/events", {"since": seq, "limit": event_limit})
                 observe_http_success(summary, "events", _elapsed, http)
                 summary.observe_events_payload(payload)
+                if payload.get("cursor_reset") is True:
+                    seq = 0
                 for item in payload.get("events", []):
                     if isinstance(item, dict):
                         item_seq = event_seq(item)
@@ -1992,10 +2320,10 @@ def wait_for_interaction_idle(
                         summary.observe_event_seq(item_seq)
                         observe_event_item(summary, item)
                         events_writer.write({"ts": utc_now(), "event": item})
-                seq = max(seq, safe_int(payload.get("latest_seq"), seq))
+                seq = event_cursor(payload, seq)
             except Exception as exc:
                 summary.fail(str(exc), http=True)
-        time.sleep(poll_interval)
+        poll_sleep(http, poll_interval)
     summary.idle_timeouts += 1
     return False, last_status, seq
 
@@ -2011,6 +2339,7 @@ def flatten_status(status: dict[str, Any]) -> dict[str, Any]:
     events = status.get("events") if isinstance(status.get("events"), dict) else {}
     interaction = status.get("interaction") if isinstance(status.get("interaction"), dict) else {}
     camera = status.get("camera") if isinstance(status.get("camera"), dict) else {}
+    ui_preview = camera.get("ui_preview") if isinstance(camera.get("ui_preview"), dict) else {}
     usb = status.get("usb") if isinstance(status.get("usb"), dict) else {}
     profile = status.get("profile") if isinstance(status.get("profile"), dict) else {}
     return {
@@ -2023,6 +2352,12 @@ def flatten_status(status: dict[str, Any]) -> dict[str, Any]:
         "usb_mounted": usb.get("mounted"),
         "camera_frames": camera.get("frames"),
         "camera_drops": camera.get("drops"),
+        **{"camera_ui_" + key: ui_preview.get(key) for key in (
+            "input_frames", "published_frames", "source_updates", "rate_limited_frames",
+            "replaced_pending_frames", "no_buffer_frames", "cache_sync_errors",
+            "input_row_bytes", "stride_bytes", "buffer_bytes", "buffer_count",
+            "integrity_checks", "integrity_mismatches", "last_mismatch_frame",
+            "pink_jump_candidates", "last_pink_frame", "last_pink_before_rgb", "last_pink_after_rgb")},
         "events_lifecycle": events.get("lifecycle"),
         "events_dropped": events.get("dropped"),
         "events_ring_overwrites": events.get("ring_overwrites"),
@@ -2036,6 +2371,8 @@ def flatten_status(status: dict[str, Any]) -> dict[str, Any]:
         "events_max_display_queue_waiting": events.get("max_display_queue_waiting"),
         "events_oldest_seq": events.get("oldest_seq"),
         "events_capacity": events.get("capacity"),
+        "events_retained_count": events.get("retained_count"),
+        "events_retained_bytes": events.get("retained_bytes"),
         "events_usb_log_started": events.get("usb_log_started"),
         "interaction_state": interaction.get("state"),
         "interaction_busy": interaction.get("busy"),
@@ -2065,6 +2402,7 @@ def init_summary(args: argparse.Namespace, output: Path) -> Summary:
     在实现变化时与项目文档同步维护。
     """
     summary = Summary()
+    summary.stress = bool(getattr(args, "stress", False))
     summary.run_id = args.run_id
     summary.run_label = args.run_label
     summary.output_dir = str(output)
@@ -2072,6 +2410,9 @@ def init_summary(args: argparse.Namespace, output: Path) -> Summary:
     summary.http_persistent_enabled = bool(args.persistent_http)
     summary.profile_expected_level = None if args.profile_level == "keep" else args.profile_level
     summary.profile_expected_interval_ms = args.profile_interval_ms if args.profile_interval_ms >= 0 else None
+    settings = {key: value for key, value in vars(args).items() if key != "test_items_set"}
+    settings["test_items"] = sorted(args.test_items_set)
+    (output / "run_settings.json").write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
 
@@ -2202,6 +2543,32 @@ def run_fault_web_timeout_probe(summary: Summary, args: argparse.Namespace) -> d
     return row
 
 
+def config_has_unredacted_secret(value: Any, key: str = "") -> bool:
+    """只检查敏感字段的实际值，不因配置键名本身而报警。"""
+    sensitive = ("api_key", "apikey", "access_token", "secret", "password")
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            child_name = str(child_key).lower()
+            if any(marker in child_name for marker in sensitive):
+                if isinstance(child_value, str):
+                    normalized = child_value.strip().lower()
+                    if normalized and not any(
+                        marker in normalized
+                        for marker in ("<redacted>", "redacted", "***", "${", "changeme", "your_")
+                    ):
+                        return True
+                elif child_value not in (None, False, 0):
+                    return True
+            if config_has_unredacted_secret(child_value, child_name):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(config_has_unredacted_secret(item, key) for item in value)
+    if isinstance(value, str):
+        return bool(re.search(r"\bsk-[A-Za-z0-9_-]{16,}\b", value))
+    return False
+
+
 def run_config_audit(http: HttpClient, summary: Summary) -> dict[str, Any]:
     """处理 scripts/long_run_test.py 中的 run config audit 逻辑。
 
@@ -2220,13 +2587,8 @@ def run_config_audit(http: HttpClient, summary: Summary) -> dict[str, Any]:
             risks.append("config_not_json")
             config = {}
         if isinstance(config, dict):
-            raw = json.dumps(config, ensure_ascii=False).lower()
-            if "sk-" in raw or "api_key" in raw or "authorization" in raw:
+            if config_has_unredacted_secret(config):
                 risks.append("possible_secret_material_present")
-            io = config.get("io") if isinstance(config.get("io"), dict) else {}
-            web = io.get("web") if isinstance(io.get("web"), dict) else {}
-            if web.get("enabled") is True and not web.get("auth"):
-                risks.append("web_console_auth_not_configured")
             runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
             if runtime.get("tls_verify") is False or runtime.get("verify_tls") is False:
                 risks.append("tls_verification_disabled")
@@ -2378,25 +2740,46 @@ def build_final_report(summary: Summary, output_dir: Path, elapsed_seconds: floa
         for key, value in sorted(summary.serial_http_attempt_stage_counts.items())
     ] or ["  serial none"]
     cpu_task_rows = []
-    for name in sorted(summary.profile_cpu_task_samples,
-                       key=lambda item: summary.profile_cpu_task_max_pct.get(item, 0.0),
-                       reverse=True)[:12]:
-        samples = summary.profile_cpu_task_samples.get(name, 0)
-        avg = summary.profile_cpu_task_total_pct.get(name, 0.0) / max(1, samples)
+    for task_key in sorted(summary.profile_cpu_task_samples,
+                           key=lambda item: summary.profile_cpu_task_max_pct.get(item, 0.0),
+                           reverse=True)[:12]:
+        samples = summary.profile_cpu_task_samples.get(task_key, 0)
+        weight_ms = summary.profile_cpu_task_weight_ms.get(task_key, 0.0)
+        avg = (
+            summary.profile_cpu_task_weighted_pct.get(task_key, 0.0) / weight_ms
+            if weight_ms > 0.0
+            else summary.profile_cpu_task_total_pct.get(task_key, 0.0) / max(1, samples)
+        )
+        name = summary.profile_cpu_task_names.get(task_key, task_key)
+        task_id = summary.profile_cpu_task_ids.get(task_key)
+        label = f"{name} (id={task_id})" if task_id is not None else name
         cpu_task_rows.append(
-            f"  {name}: samples={samples}, avg={avg:.2f}%, "
-            f"max={summary.profile_cpu_task_max_pct.get(name, 0.0):.2f}%, "
-            f"last={summary.profile_cpu_task_last_pct.get(name, 0.0):.2f}%"
+            f"  {label}: samples={samples}, avg={avg:.2f}%, "
+            f"max={summary.profile_cpu_task_max_pct.get(task_key, 0.0):.2f}%, "
+            f"last={summary.profile_cpu_task_last_pct.get(task_key, 0.0):.2f}%"
         )
     if not cpu_task_rows:
         cpu_task_rows.append("  none")
-    cpu_total_avg = summary.profile_cpu_total_sum_pct / max(1, summary.profile_cpu_total_samples)
+    cpu_total_avg = (
+        summary.profile_cpu_total_weighted_pct / summary.profile_cpu_total_weight_ms
+        if summary.profile_cpu_total_weight_ms > 0.0
+        else (
+            summary.profile_cpu_total_sum_pct / summary.profile_cpu_total_samples
+            if summary.profile_cpu_total_samples > 0 else None
+        )
+    )
+    cpu_total_avg_text = "n/a" if cpu_total_avg is None else f"{cpu_total_avg:.2f}%"
     cpu_core_rows = []
     for core in sorted(summary.profile_cpu_core_samples):
         samples = summary.profile_cpu_core_samples.get(core, 0)
-        avg = summary.profile_cpu_core_total_pct.get(core, 0.0) / max(1, samples)
+        weight_ms = summary.profile_cpu_core_weight_ms.get(core, 0.0)
+        avg = (
+            summary.profile_cpu_core_weighted_pct.get(core, 0.0) / weight_ms
+            if weight_ms > 0.0
+            else summary.profile_cpu_core_total_pct.get(core, 0.0) / max(1, samples)
+        )
         cpu_core_rows.append(
-            f"  CPU{core}: samples={samples}, avg={avg:.2f}%, "
+            f"  CPU{core}: samples={samples}, window-weighted avg={avg:.2f}%, "
             f"max={summary.profile_cpu_core_max_pct.get(core, 0.0):.2f}%, "
             f"last={summary.profile_cpu_core_last_pct.get(core, 0.0):.2f}%"
         )
@@ -2407,6 +2790,7 @@ def build_final_report(summary: Summary, output_dir: Path, elapsed_seconds: floa
         "C-Claw long-run test summary",
         f"Run ID: {summary.run_id or 'unknown'}",
         f"Run label: {summary.run_label or 'none'}",
+        f"Stress mode: {summary.stress}; status samples / local commands: {summary.stress_status_samples}/{summary.stress_commands}",
         f"Started: {summary.started_at}",
         f"Finished: {summary.finished_at or utc_now()}",
         f"Elapsed: {format_duration(elapsed_seconds)}",
@@ -2429,6 +2813,7 @@ def build_final_report(summary: Summary, output_dir: Path, elapsed_seconds: floa
         "  Ring overwrites are device-side old event replacements; Python event loss is indicated by seq gap lost.",
         f"  Event oldest seq/capacity: {summary.min_events_oldest_seq}/{summary.max_events_capacity}",
         f"  Reboots observed: {summary.reboots_observed}",
+        f"  Event cursor resets/gap payloads/truncated payloads/omitted: {summary.event_cursor_resets}/{summary.event_gap_payloads}/{summary.event_truncated_payloads}/{summary.event_omitted}",
         "",
         "HTTP latency:",
         f"  Persistent HTTP: {str(summary.http_persistent_enabled).lower()}, connection rebuilds: {summary.http_connection_rebuilds}",
@@ -2509,7 +2894,10 @@ def build_final_report(summary: Summary, output_dir: Path, elapsed_seconds: floa
         *profile_phase_lines,
         "  CPU:",
         f"  CPU samples available/unavailable: {summary.profile_cpu_available_samples}/{summary.profile_cpu_unavailable_samples}",
-        f"  Legacy total CPU samples/avg/max/last: {summary.profile_cpu_total_samples}/{cpu_total_avg:.2f}%/{summary.profile_cpu_total_max_pct:.2f}%/{summary.profile_cpu_total_last_pct if summary.profile_cpu_total_last_pct is not None else 'n/a'}",
+        f"  CPU window valid/invalid: {summary.profile_cpu_valid_samples}/{summary.profile_cpu_invalid_samples}",
+        f"  CPU total samples/window-weighted avg/max/last: {summary.profile_cpu_total_samples}/{cpu_total_avg_text}/{summary.profile_cpu_total_max_pct:.2f}%/{summary.profile_cpu_total_last_pct if summary.profile_cpu_total_last_pct is not None else 'n/a'}",
+        f"  CPU legacy frames/invalid values/truncated frames/unbound-task rows/duplicate windows: {summary.profile_cpu_legacy_samples}/{summary.profile_cpu_invalid_value_count}/{summary.profile_cpu_truncated_samples}/{summary.profile_cpu_unknown_core_task_samples}/{summary.profile_cpu_duplicate_samples}",
+        f"  CPU task IDs missing: {summary.profile_cpu_task_id_missing}",
         "  CPU core totals:",
         *cpu_core_rows,
         "  Top task samples:",
@@ -2526,6 +2914,33 @@ def build_final_report(summary: Summary, output_dir: Path, elapsed_seconds: floa
         f"  {output_dir / 'summary.json'}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def run_exit_code(summary: Summary, args: argparse.Namespace) -> int:
+    """只要存在已知失败或 CPU 观测无法判定，就返回失败退出码。"""
+    failed = (
+        summary.last_error is not None or
+        summary.http_errors > 0 or
+        summary.serial_write_failures > 0 or
+        summary.serial_errors > 0 or
+        summary.short_conversation_failures > 0 or
+        summary.long_conversation_failures > 0 or
+        summary.context_check_failures > 0 or
+        summary.reboots_observed > 0 or summary.event_cursor_resets > 0 or
+        summary.event_gap_payloads > 0 or summary.event_truncated_payloads > 0 or
+        summary.incomplete_run
+    )
+    if has_item(args, "profile"):
+        cpu_seen = summary.profile_cpu_available_samples + summary.profile_cpu_unavailable_samples
+        failed = failed or summary.profile_cpu_invalid_value_count > 0
+        failed = failed or (summary.profile_events > 0 and (cpu_seen == 0 or summary.profile_cpu_valid_samples == 0))
+        if summary.stress and summary.stop_reason != "dry_run":
+            failed = failed or summary.profile_cpu_valid_samples == 0
+    if summary.stress and summary.stop_reason != "dry_run":
+        failed = failed or summary.stress_status_samples == 0
+        if has_item(args, "short_conversation") or has_item(args, "long_conversation"):
+            failed = failed or (summary.short_conversations + summary.long_conversation_turns == 0)
+    return 1 if failed else 0
 
 
 def run_dry(args: argparse.Namespace) -> int:
@@ -2565,7 +2980,7 @@ def run_dry(args: argparse.Namespace) -> int:
     (output / "summary_report.txt").write_text(report, encoding="utf-8")
     print(report, end="")
     print(f"dry-run ok: wrote outputs to {output}")
-    return 0
+    return run_exit_code(summary, args)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -2631,6 +3046,50 @@ def run(args: argparse.Namespace) -> int:
         short_conversation_enabled or long_conversation_enabled
     )
     conversation_events_required = short_conversation_enabled or long_conversation_enabled
+    next_stress_sample = 0.0
+    next_stress_command = 0.0
+
+    def checkpoint() -> None:
+        nonlocal previous_uptime, latest_status, next_stress_sample, next_stress_command
+        if stop_event.is_set() or should_stop_for_file(args):
+            summary.stop_reason = summary.stop_reason or "user_stop"
+            raise RunStopped()
+        now = time.monotonic()
+        if end_at is not None and now >= end_at:
+            summary.stop_reason = "duration_complete"
+            raise RunStopped()
+        if not args.stress or now < next_stress_sample:
+            return
+        next_stress_sample = now + 2.0
+        row: dict[str, Any] = {"ts": utc_now(), "stress_sample": True}
+        try:
+            status, elapsed = http.get_json("/api/status")
+            observe_http_success(summary, "status", elapsed, http)
+            previous_uptime = summary.observe_status(status, previous_uptime)
+            summary.observe_profile_config(status)
+            latest_status = flatten_status(status)
+            row["status"] = latest_status
+            summary.stress_status_samples += 1
+            if network_commands_enabled and now >= next_stress_command:
+                next_stress_command = now + 5.0
+                # /heap is local and does not enqueue another LLM request.
+                elapsed = http.post_message("/heap")
+                observe_http_success(summary, "messages", elapsed, http)
+                summary.stress_commands += 1
+                row["stress_command"] = "/heap"
+        except Exception as exc:
+            summary.fail(str(exc), http=True)
+            row["error"] = str(exc)
+        for line in serial_worker.recent_lines(1000):
+            summary.observe_serial_line(line)
+        for err_text in serial_worker.recent_errors():
+            summary.serial_errors += 1
+            summary.last_error = err_text
+        run_status.write(row)
+        summary.elapsed_seconds = round(time.monotonic() - started_mono, 3)
+        write_summary(summary_path, summary)
+
+    http.checkpoint = checkpoint
     if not short_conversation_enabled:
         next_short = float("inf")
     if not long_conversation_enabled:
@@ -2648,18 +3107,26 @@ def run(args: argparse.Namespace) -> int:
     if not serial_worker.available and not args.no_serial:
         print("Serial is not available yet; test will continue with Web Console and record serial errors.", file=sys.stderr)
 
-    profile_guard_results = apply_profile_guard(http, summary, args)
-    if profile_guard_results:
-        run_status.write({"ts": utc_now(), "profile_guard": profile_guard_results})
-
-    if config_audit_enabled:
-        run_status.write(run_config_audit(http, summary))
-    if fault_ota_reject_enabled:
-        run_status.write(run_fault_ota_reject_probe(http, summary, args))
-    if fault_web_timeout_enabled:
-        run_status.write(run_fault_web_timeout_probe(summary, args))
-
     try:
+        # Establish a boundary before generating workload; boot history is not a test-time gap.
+        if events_enabled or conversation_events_required:
+            try:
+                baseline, elapsed = http.get_json("/api/events", {"since": 0, "limit": 1})
+                observe_http_success(summary, "events", elapsed, http)
+                latest_seq = event_cursor(baseline, 0)
+                run_status.write({"ts": utc_now(), "event_baseline_seq": latest_seq,
+                                  "note": "Events before this cursor belong to pre-test history."})
+            except Exception as exc:
+                summary.fail(str(exc), http=True)
+        profile_guard_results = apply_profile_guard(http, summary, args)
+        if profile_guard_results:
+            run_status.write({"ts": utc_now(), "profile_guard": profile_guard_results})
+        if config_audit_enabled:
+            run_status.write(run_config_audit(http, summary))
+        if fault_ota_reject_enabled:
+            run_status.write(run_fault_ota_reject_probe(http, summary, args))
+        if fault_web_timeout_enabled:
+            run_status.write(run_fault_web_timeout_probe(summary, args))
         while not stop_event.is_set():
             if should_stop_for_file(args):
                 summary.stop_reason = "user_stop"
@@ -2668,6 +3135,7 @@ def run(args: argparse.Namespace) -> int:
                 summary.stop_reason = "duration_complete"
                 break
             loop_started = time.monotonic()
+            checkpoint()
             summary.loops += 1
             row: dict[str, Any] = {"ts": utc_now(), "loop": summary.loops}
 
@@ -2688,12 +3156,15 @@ def run(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     summary.fail(str(exc), http=True)
                     row["status_error"] = str(exc)
+                    latest_status = None
 
             if events_enabled or conversation_events_required:
                 try:
                     events_payload, events_elapsed = http.get_json("/api/events", {"since": latest_seq, "limit": args.event_limit})
                     observe_http_success(summary, "events", events_elapsed, http)
                     summary.observe_events_payload(events_payload)
+                    if events_payload.get("cursor_reset") is True:
+                        latest_seq = 0
                     batch = events_payload.get("events") if isinstance(events_payload.get("events"), list) else []
                     row["events_count"] = len(batch)
                     row["http_events_elapsed_ms"] = round(events_elapsed * 1000, 2)
@@ -2704,7 +3175,8 @@ def run(args: argparse.Namespace) -> int:
                             summary.observe_event_seq(seq)
                             observe_event_item(summary, item)
                             events_log.write({"ts": utc_now(), "event": item})
-                    latest_seq = max(latest_seq, safe_int(events_payload.get("latest_seq"), latest_seq))
+                    latest_seq = event_cursor(events_payload, latest_seq)
+                    row["event_delivery"] = {k: events_payload.get(k) for k in ("gap", "truncated", "omitted", "cursor_reset")}
                 except Exception as exc:
                     summary.fail(str(exc), http=True)
                     row["events_error"] = str(exc)
@@ -2768,7 +3240,9 @@ def run(args: argparse.Namespace) -> int:
                 next_network_command = now + max(args.interval * 2, 2.0)
 
             if now >= next_short:
-                prompt = SHORT_PROMPTS[summary.short_conversations % len(SHORT_PROMPTS)]
+                checkpoint()
+                short_attempts = summary.short_conversations + summary.short_conversation_failures
+                prompt = SHORT_PROMPTS[short_attempts % len(SHORT_PROMPTS)]
                 start_seq = latest_seq
                 started = time.monotonic()
                 record = {"ts": utc_now(), "type": "short", "prompt": prompt, "start_seq": start_seq}
@@ -2783,6 +3257,7 @@ def run(args: argparse.Namespace) -> int:
                             raise RuntimeError("device did not become idle before short conversation")
                         start_seq = latest_seq if latest_seq is not None else start_seq
                         record["start_seq"] = start_seq
+                    checkpoint()
                     submit_elapsed = http.post_message(prompt)
                     observe_http_success(summary, "messages", submit_elapsed, http)
                     submit_elapsed_ms = round(submit_elapsed * 1000, 2)
@@ -2812,8 +3287,9 @@ def run(args: argparse.Namespace) -> int:
                             **final_timing,
                         }
                     )
-                    summary.short_conversations += 1
-                    if not ok:
+                    if ok:
+                        summary.short_conversations += 1
+                    else:
                         summary.short_conversation_failures += 1
                         reason = classify_conversation_failure(ok, final_timing)
                         summary.observe_conversation_failure(reason)
@@ -2827,12 +3303,14 @@ def run(args: argparse.Namespace) -> int:
                 conversations.write(record)
                 next_short = time.monotonic() + args.conversation_interval
 
-            if now >= next_long:
+            if time.monotonic() >= next_long:
+                checkpoint()
                 turns = make_long_conversation(args.long_conversation_turns)
                 conversation_id = f"long-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
                 summary.long_conversations += 1
                 long_failed = False
                 for idx, turn in enumerate(turns, start=1):
+                    checkpoint()
                     if stop_event.is_set() or should_stop_for_file(args):
                         if should_stop_for_file(args):
                             summary.stop_reason = "user_stop"
@@ -2861,6 +3339,7 @@ def run(args: argparse.Namespace) -> int:
                                 raise RuntimeError("device did not become idle before long conversation turn")
                             start_seq = latest_seq if latest_seq is not None else start_seq
                             record["start_seq"] = start_seq
+                        checkpoint()
                         submit_elapsed = http.post_message(prompt)
                         observe_http_success(summary, "messages", submit_elapsed, http)
                         submit_elapsed_ms = round(submit_elapsed * 1000, 2)
@@ -2883,11 +3362,13 @@ def run(args: argparse.Namespace) -> int:
                         log_incomplete = bool(final_timing.get("log_incomplete")) or (
                             final_timing.get("assistant_event_count", 0) > 0 and not response_text
                         )
-                        context_ok = (contains_all(response_text, expected) if expected else True) or log_incomplete
+                        context_inconclusive = log_incomplete
+                        context_ok = (contains_all(response_text, expected) if expected else True) and not context_inconclusive
                         record.update(
                             {
                                 "ok": ok,
                                 "context_ok": context_ok,
+                                "context_inconclusive": context_inconclusive,
                                 "log_incomplete": log_incomplete,
                                 "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
                                 "events": len(response_events),
@@ -2930,7 +3411,7 @@ def run(args: argparse.Namespace) -> int:
                         summary.observe_conversation_failure(reason)
                         record.update({"ok": False, "context_ok": False, "failure_reason": reason, "error": str(exc), "trace": traceback.format_exc(limit=3)})
                     long_conversations.write(record)
-                    time.sleep(max(args.interval, 1.0))
+                    poll_sleep(http, max(args.interval, 1.0))
                 if long_failed:
                     summary.long_conversation_failures += 1
                 next_long = time.monotonic() + args.long_conversation_interval
@@ -2951,6 +3432,9 @@ def run(args: argparse.Namespace) -> int:
             sleep_for = max(0.0, args.interval - (time.monotonic() - loop_started))
             if sleep_for:
                 stop_event.wait(sleep_for)
+    except RunStopped:
+        run_status.write({"ts": utc_now(), "stopped": summary.stop_reason,
+                          "note": "In-flight device work may continue; no new requests will be submitted."})
     except Exception as exc:
         summary.stop_reason = "exception"
         summary.fail(str(exc), http=False)
@@ -2979,7 +3463,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"long-run finished: loops={summary.loops} output={output}")
     if summary.last_error:
         print(f"last error: {summary.last_error}", file=sys.stderr)
-    return 0
+    return run_exit_code(summary, args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2988,11 +3472,14 @@ def build_parser() -> argparse.ArgumentParser:
     该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
     在实现变化时与项目文档同步维护。
     """
-    parser = argparse.ArgumentParser(description="C-Claw serial + Web Console long-running test tool")
+    parser = argparse.ArgumentParser(description="C-Claw functional stability tests and staged pressure boundary search")
+    from firmware_test_modes import add_arguments
+    add_arguments(parser)
+    parser.add_argument("--stress", action="store_true", help="Alias for --mode stress (staged boundary search)")
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT)
     parser.add_argument("--baudrate", type=int, default=DEFAULT_BAUDRATE)
     parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--duration", default="6h", help="Duration such as 10m, 6h, 0/forever")
+    parser.add_argument("--duration", default="1h", help="Functional test duration / stress search time budget, e.g. 1h")
     parser.add_argument("--interval", type=float, default=5.0, help="Base loop interval in seconds")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--http-timeout", type=float, default=8.0)
@@ -3030,16 +3517,43 @@ def main(argv: list[str] | None = None) -> int:
     在实现变化时与项目文档同步维护。
     """
     parser = build_parser()
-    args = parser.parse_args(argv)
-    args.duration_seconds = parse_duration(args.duration)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_args)
+    supplied = {arg.split("=", 1)[0] for arg in raw_args if arg.startswith("--")}
+    if args.stress and "--mode" in supplied and args.mode != "stress":
+        parser.error("--stress conflicts with --mode functional")
+    if args.stress:
+        args.mode = "stress"
+    args.stress = args.mode == "stress"
+    if args.stress:
+        for key, value in STRESS_DEFAULTS.items():
+            if "--" + key.replace("_", "-") not in supplied:
+                setattr(args, key, value)
+    try:
+        args.duration_seconds = parse_duration(args.duration)
+        if args.duration_seconds is not None and (not math.isfinite(args.duration_seconds) or args.duration_seconds <= 0):
+            raise ValueError("duration must be positive or 0/forever")
+        for key in ("interval", "http_timeout", "event_poll_interval", "idle_timeout", "conversation_timeout", "long_conversation_timeout"):
+            if not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0:
+                raise ValueError(f"{key} must be finite and positive")
+        for key in ("conversation_interval", "long_conversation_interval", "status_interval"):
+            if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
+                raise ValueError(f"{key} must be finite and non-negative")
+        if args.event_limit <= 0:
+            raise ValueError("event_limit must be positive")
+        from firmware_test_modes import validate_arguments
+        validate_arguments(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.run_id = args.run_id or make_run_id()
     try:
         args.test_items_set = parse_test_items(args.test_items)
+        if args.no_serial:
+            args.test_items_set.discard("serial_commands")
     except ValueError as exc:
         parser.error(str(exc))
-    if args.dry_run:
-        return run_dry(args)
-    return run(args)
+    from firmware_test_modes import run_mode
+    return run_mode(args, sys.modules[__name__])
 
 
 if __name__ == "__main__":

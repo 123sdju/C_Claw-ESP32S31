@@ -55,10 +55,10 @@ typedef struct {
     long mtime;
 } lua_script_info_t;
 
-/*
- * Lua 工具专用内存分配，优先使用 PSRAM（若启用），失败则回退到内部 RAM。
- * 参数: size - 分配字节数，0 时按 1 字节处理
- * 返回: 分配的内存指针，失败返回 NULL
+/**
+ * @brief 申请工具辅助块，优先 PSRAM 并回退内部 RAM。
+ * @param[in] size 字节数，零规范为一字节。
+ * @return 调用者拥有块，失败 NULL，由 lua_tool_release 或兼容 free 回收，可并发。
  */
 static void *lua_tool_alloc(size_t size)
 {
@@ -74,11 +74,11 @@ static void *lua_tool_alloc(size_t size)
     return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
-/*
- * Lua 工具专用内存重分配，优先 PSRAM，失败回退内部 RAM。
- * 参数: ptr - 原内存指针
- *       size - 新大小，0 时按 1 字节处理
- * 返回: 重分配后的指针，失败返回 NULL
+/**
+ * @brief 调整工具辅助拥有块，优先 PSRAM 并回退内部 RAM。
+ * @param[in,out] ptr 独占拥有块，可 NULL。
+ * @param[in] size 新字节数，零规范为一字节。
+ * @return 成功新拥有块且旧指针失效，失败 NULL 且原块保持。
  */
 static void *lua_tool_resize(void *ptr, size_t size)
 {
@@ -94,9 +94,10 @@ static void *lua_tool_resize(void *ptr, size_t size)
     return heap_caps_realloc(ptr, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
-/*
- * 释放 lua_tool_alloc 分配的内存。
- * 参数: ptr - 待释放的内存指针，可为 NULL
+/**
+ * @brief 归还工具辅助拥有块。
+ * @param[in] ptr 转移拥有权的能力堆指针，可 NULL。
+ * @post 非空块失效，调用者清理其引用，禁止并发访问同一块。
  */
 static void lua_tool_release(void *ptr)
 {
@@ -105,10 +106,10 @@ static void lua_tool_release(void *ptr)
     }
 }
 
-/*
- * 使用 PSRAM 分配复制字符串（类似 strdup），NULL 输入视为空串。
- * 参数: text - 源字符串，可为 NULL
- * 返回: 新分配的副本，失败返回 NULL
+/**
+ * @brief 复制字符串到工具辅助存储。
+ * @param[in] text 调用期 NUL 借用，NULL 按空串。
+ * @return 调用者拥有副本，PSRAM/内部 RAM 均失败时 NULL，由兼容 free 回收。
  */
 static char *lua_tool_dup(const char *text)
 {
@@ -122,11 +123,11 @@ static char *lua_tool_dup(const char *text)
     return copy;
 }
 
-/*
- * 构造一个拥有 message 所有权的 cc_result_t，调用方负责传入已分配的消息字符串。
- * 参数: code - 错误码
- *       message - 已分配的错误消息（将被 result 接管所有权）
- * 返回: 构造的 cc_result_t
+/**
+ * @brief 将已分配诊断交给结果对象。
+ * @param[in] code 按值状态码。
+ * @param[in] message 转移拥有权的诊断，可 NULL。
+ * @return 拥有字段由接收者 cc_result_free 回收，无额外分配。
  */
 static cc_result_t lua_tool_result_owned(cc_error_code_t code, char *message)
 {
@@ -138,27 +139,27 @@ static cc_result_t lua_tool_result_owned(cc_error_code_t code, char *message)
     return result;
 }
 
-/*
- * 复制消息字符串并构造系统级错误 cc_result_t。
- * 参数: code - 错误码
- *       message - 错误消息字符串
- * 返回: 构造的 cc_result_t（消息由 lua_tool_dup 分配）
+/**
+ * @brief 复制诊断并构造系统级结果。
+ * @param[in] code 按值状态码，诊断分配失败仍保留。
+ * @param[in] message 调用期 NUL 借用，NULL 按空串。
+ * @return 拥有诊断由 cc_result_free，OOM 时 message 可 NULL。
  */
 static cc_result_t lua_tool_system_error(cc_error_code_t code, const char *message)
 {
     return lua_tool_result_owned(code, lua_tool_dup(message));
 }
 
-/*
- * 确保 lua_tool_buffer_t 容量至少为 needed 字节，采用倍增策略扩容，
- * 受 max_bytes 硬上限约束。
- * 参数: buffer - 动态缓冲区
- *       needed - 所需最小容量
- * 返回: true 成功，false 内存不足
+/**
+ * @brief 在内容预算加一范围内扩容独占缓冲。
+ * @param[in,out] buffer 调用期独占状态借用，NULL 返回 false。
+ * @param[in] needed 包含 NUL 的所需容量。
+ * @return 已满足或扩容成功 true，溢出/超预算/OOM false，失败保留原块及容量。
  */
 static bool lua_tool_buffer_reserve(lua_tool_buffer_t *buffer, size_t needed)
 {
-    if (!buffer || needed <= buffer->cap) {
+    if (!buffer) return false;
+    if (needed <= buffer->cap) {
         return true;
     }
 
@@ -166,6 +167,7 @@ static bool lua_tool_buffer_reserve(lua_tool_buffer_t *buffer, size_t needed)
     if (hard_cap == 0) {
         return false;
     }
+    if (needed > hard_cap) return false;
 
     size_t next_cap = buffer->cap ? buffer->cap : 256;
     while (next_cap < needed) {
@@ -188,21 +190,20 @@ static bool lua_tool_buffer_reserve(lua_tool_buffer_t *buffer, size_t needed)
     return true;
 }
 
-/*
- * 向动态缓冲区追加指定长度的数据，自动扩容并截断到 max_bytes 限制。
- * 参数: buffer - 动态缓冲区
- *       text - 待追加数据
- *       len - 数据长度（字节）
- * 返回: true 成功，false 内存不足
+/**
+ * @brief 按剩余字节预算追加数据并静默裁剪。
+ * @param[in,out] buffer 独占缓冲借用，NULL 跳过。
+ * @param[in] text 至少 len 字节借用，NULL 跳过，禁止与可搬迁输出块别名。
+ * @param[in] len 输入字节数，零跳过。
+ * @return 接纳/截断 true，扩容失败 false，原块保持，由 buffer 继续拥有。
  */
 static bool lua_tool_buffer_append_len(lua_tool_buffer_t *buffer, const char *text, size_t len)
 {
     if (!buffer || !text || len == 0) {
         return true;
     }
-    if (buffer->len + len >= buffer->max_bytes) {
-        len = buffer->max_bytes > buffer->len ? buffer->max_bytes - buffer->len : 0;
-    }
+    size_t room = buffer->max_bytes > buffer->len ? buffer->max_bytes - buffer->len : 0;
+    if (len > room) len = room;
     if (len == 0) {
         return true;
     }
@@ -215,23 +216,23 @@ static bool lua_tool_buffer_append_len(lua_tool_buffer_t *buffer, const char *te
     return true;
 }
 
-/*
- * 向动态缓冲区追加 C 字符串（以 '\0' 结尾）。
- * 参数: buffer - 动态缓冲区
- *       text - 待追加的字符串，可为 NULL
- * 返回: true 成功，false 内存不足
+/**
+ * @brief 追加可选 NUL 字符串。
+ * @param[in,out] buffer 独占缓冲借用，可 NULL 时跳过。
+ * @param[in] text 调用期非别名借用，NULL 按空串。
+ * @return 接纳/截断 true，扩容失败 false，无拥有权转交。
  */
 static bool lua_tool_buffer_append(lua_tool_buffer_t *buffer, const char *text)
 {
     return lua_tool_buffer_append_len(buffer, text, text ? strlen(text) : 0);
 }
 
-/*
- * 格式化追加到动态缓冲区（printf 风格），小格式串走栈缓冲区优化。
- * 参数: buffer - 动态缓冲区
- *       fmt - printf 格式串，可为 NULL
- *       ... - 可变参数
- * 返回: true 成功，false 内存不足
+/**
+ * @brief 格式化后在字节预算内追加，短文本使用栈缓冲。
+ * @param[in,out] buffer 独占缓冲借用。
+ * @param[in] fmt 调用期 printf 格式借用，NULL 按空串。
+ * @param[in] ... 与格式匹配并覆盖两次格式化的参数借用。
+ * @return 接纳/截断 true，格式化或分配失败 false，临时拥有块始终释放。
  */
 static bool lua_tool_buffer_appendf(lua_tool_buffer_t *buffer, const char *fmt, ...)
 {
@@ -254,8 +255,9 @@ static bool lua_tool_buffer_appendf(lua_tool_buffer_t *buffer, const char *fmt, 
     } else {
         char *tmp = (char *)lua_tool_alloc((size_t)needed + 1);
         if (tmp) {
-            vsnprintf(tmp, (size_t)needed + 1, fmt ? fmt : "", args);
-            ok = lua_tool_buffer_append_len(buffer, tmp, (size_t)needed);
+            int written = vsnprintf(tmp, (size_t)needed + 1, fmt ? fmt : "", args);
+            if (written >= 0 && written <= needed)
+                ok = lua_tool_buffer_append_len(buffer, tmp, (size_t)written);
             lua_tool_release(tmp);
         }
     }
@@ -263,11 +265,11 @@ static bool lua_tool_buffer_appendf(lua_tool_buffer_t *buffer, const char *fmt, 
     return ok;
 }
 
-/*
- * 将错误消息写入工具调用结果，使用 PSRAM 分配错误文本。
- * 参数: out_result - 工具调用结果
- *       message - 错误消息，NULL 时使用默认 "Lua tool failed"
- * 返回: CC_OK 或内存分配失败的系统错误
+/**
+ * @brief 向空结果交付工具失败诊断。
+ * @param[out] out_result 必填独占空结果，拥有诊断由 cc_tool_result_cleanup。
+ * @param[in] message 调用期 NUL 借用，NULL 用默认错误。
+ * @return 成功分配 CC_OK，OOM 返回系统错误，其诊断由 cc_result_free。
  */
 static cc_result_t lua_tool_set_error(cc_tool_result_t *out_result, const char *message)
 {
@@ -279,12 +281,10 @@ static cc_result_t lua_tool_set_error(cc_tool_result_t *out_result, const char *
     return cc_result_ok();
 }
 
-/*
- * 根据工具 mode 返回对应的名称标识符：
- *   CODE → "lua_run_code", FILE → "lua_run_file",
- *   DRIVER_QUERY → "lua_driver_info", SCRIPT_QUERY → "lua_script_search"
- * 参数: self - lua_tool_t 实例
- * 返回: 工具名称字符串
+/**
+ * @brief 查询实例模式对应的工具名称。
+ * @param[in] self 调用期实例借用，NULL/未知模式采用代码工具。
+ * @return 常驻只读名称借用，无分配，实例存活期间可并发读取。
  */
 static const char *lua_tool_name(void *self)
 {
@@ -301,10 +301,10 @@ static const char *lua_tool_name(void *self)
     return "lua_run_code";
 }
 
-/*
- * 根据工具 mode 返回对应功能描述字符串，提供给 Agent 理解工具用途。
- * 参数: self - lua_tool_t 实例
- * 返回: 英文描述字符串
+/**
+ * @brief 查询实例模式对应的功能描述。
+ * @param[in] self 调用期实例借用，NULL/未知模式采用代码工具。
+ * @return 常驻只读描述借用，无分配，实例存活期间可并发读取。
  */
 static const char *lua_tool_description(void *self)
 {
@@ -321,14 +321,10 @@ static const char *lua_tool_description(void *self)
     return "Run bounded Lua source code directly with safe standard libraries and C-Claw Lua drivers";
 }
 
-/*
- * 根据工具 mode 返回对应的 JSON Schema：
- *   CODE - 要求 "code" 字段 + 运行限制参数
- *   FILE - 要求 "path" 字段 + 运行限制参数
- *   DRIVER_QUERY - 可选 "driver" 字段查询单个驱动
- *   SCRIPT_QUERY - 可选 "query"/"limit"/"path" 搜索脚本
- * 参数: self - lua_tool_t 实例
- * 返回: JSON Schema 字符串
+/**
+ * @brief 查询代码、文件、驱动查询或脚本搜索模式的 Schema。
+ * @param[in] self 调用期实例借用，NULL/未知模式采用代码工具。
+ * @return 常驻只读 JSON 借用，无分配，可并发读取。
  */
 static const char *lua_tool_schema_json(void *self)
 {
@@ -377,14 +373,14 @@ static const char *lua_tool_schema_json(void *self)
     "}";
 }
 
-/*
- * 从 JSON 对象中读取整数字段，不存在时用默认值，越界时钳位到 [min, max]。
- * 参数: root - JSON 对象
- *       key - 字段名
- *       default_value - 默认值
- *       min_value - 下限
- *       max_value - 上限
- * 返回: 解析并钳位后的整数值
+/**
+ * @brief 读取整数字段并按上下界钳位。
+ * @param[in] root 调用期 JSON 对象借用。
+ * @param[in] key 非 NULL 调用期 NUL 键名借用。
+ * @param[in] default_value 字段缺失时返回值。
+ * @param[in] min_value 允许下界，不大于 max_value。
+ * @param[in] max_value 允许上界。
+ * @return 字段经 JSON 整数转换及钳位的值，缺失用默认值，无分配。
  */
 static int lua_json_int_or_default(cc_json_value_t *root,
                                    const char *key,
@@ -407,17 +403,18 @@ static int lua_json_int_or_default(cc_json_value_t *root,
     return parsed;
 }
 
-/*
- * 从 JSON 参数和工具上下文中解析 Lua 运行限制（脚本大小/超时/输出/堆内存），
- * 各参数均有安全上下限钳位。若 ctx 设定了更小的 timeout_ms 则以 ctx 为准。
- * 参数: root - JSON 对象
- *       ctx - 工具上下文（用于获取外层超时限制）
- * 返回: 解析后的 lua_runtime_limits_t
+/**
+ * @brief 解析运行预算并收紧到工具上下文的正超时。
+ * @param[in] root 调用期 JSON 对象借用。
+ * @param[in] ctx 调用期上下文借用，可 NULL，取消令牌借用传给同步执行。
+ * @return 按值限制，字节及时间字段按 Schema 范围钳位，无拥有资源。
+ * @pre 上下文取消令牌存活覆盖随后执行，SDK 锁内查询允许其他任务并发取消。
  */
 static lua_runtime_limits_t lua_tool_parse_limits(cc_json_value_t *root,
                                                   const cc_tool_context_t *ctx)
 {
     lua_runtime_limits_t limits = lua_runtime_default_limits();
+    limits.cancel_token = ctx ? ctx->cancel_token : NULL;
     limits.max_script_bytes = (size_t)lua_json_int_or_default(root,
                                                              "max_script_bytes",
                                                              (int)limits.max_script_bytes,
@@ -440,10 +437,10 @@ static lua_runtime_limits_t lua_tool_parse_limits(cc_json_value_t *root,
     return limits;
 }
 
-/*
- * 列出所有已注册 Lua 驱动的名称、全局变量名和摘要，结果写入 out_result->text。
- * 参数: out_result - [出参] 工具调用结果
- * 返回: CC_OK 或内存不足错误
+/**
+ * @brief 格式化全部常驻驱动信息。
+ * @param[out] out_result 必填独占空结果，成功取得 text 拥有权，由 cc_tool_result_cleanup。
+ * @return CC_OK 或 OOM，诊断由 cc_result_free，失败释放缓冲，输出最多 4096 字节。
  */
 static cc_result_t lua_driver_info_all(cc_tool_result_t *out_result)
 {
@@ -479,11 +476,11 @@ static cc_result_t lua_driver_info_all(cc_tool_result_t *out_result)
     return cc_result_ok();
 }
 
-/*
- * 查询单个 Lua 驱动的详细信息（名称、全局变量、摘要、文档），结果写入 out_result->text。
- * 参数: name - 驱动名称
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK（成功/驱动不存在时通过 out_result 区分）
+/**
+ * @brief 格式化指定常驻驱动的详细文档。
+ * @param[in] name 调用期 NUL 名称借用，NULL 无匹配。
+ * @param[out] out_result 必填独占空结果，拥有文本/诊断由 cc_tool_result_cleanup。
+ * @return CC_OK，未知驱动令 ok 为零，OOM 为系统错误并清理缓冲，诊断由 cc_result_free。
  */
 static cc_result_t lua_driver_info_one(const char *name, cc_tool_result_t *out_result)
 {
@@ -515,11 +512,11 @@ static cc_result_t lua_driver_info_one(const char *name, cc_tool_result_t *out_r
     return cc_result_ok();
 }
 
-/*
- * 驱动查询分发：有 "driver" 参数则查单个驱动，否则列出全部驱动。
- * 参数: root - JSON 对象
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK 或错误
+/**
+ * @brief 按可选 driver 字段分发驱动查询。
+ * @param[in] root 调用期 JSON 借用，字段字符串不逸出。
+ * @param[out] out_result 必填独占空结果，拥有字段由 cc_tool_result_cleanup。
+ * @return 下层状态，系统诊断由 cc_result_free，空名称列出全部。
  */
 static cc_result_t lua_driver_info_call(cc_json_value_t *root,
                                          cc_tool_result_t *out_result)
@@ -531,22 +528,22 @@ static cc_result_t lua_driver_info_call(cc_json_value_t *root,
     return lua_driver_info_one(driver, out_result);
 }
 
-/*
- * 判断字符串 text 是否以 prefix 开头。
- * 参数: text - 待检查字符串
- *       prefix - 前缀
- * 返回: true 匹配，false 任一为 NULL 或不匹配
+/**
+ * @brief 检查区分大小写的前缀。
+ * @param[in] text 调用期 NUL 文本借用，可 NULL。
+ * @param[in] prefix 调用期 NUL 前缀借用，可 NULL。
+ * @return 匹配 true，参数 NULL 或不匹配 false，无分配。
  */
 static bool lua_script_starts_with(const char *text, const char *prefix)
 {
     return text && prefix && strncmp(text, prefix, strlen(prefix)) == 0;
 }
 
-/*
- * 判断字符串 text 是否以 suffix 结尾（主要用于检测 ".lua" 后缀）。
- * 参数: text - 待检查字符串
- *       suffix - 后缀
- * 返回: true 匹配，false 任一为 NULL 或不匹配
+/**
+ * @brief 检查区分大小写的后缀。
+ * @param[in] text 调用期 NUL 文本借用，可 NULL。
+ * @param[in] suffix 调用期 NUL 后缀借用，可 NULL。
+ * @return 匹配 true，参数 NULL 或不匹配 false，无分配。
  */
 static bool lua_script_ends_with(const char *text, const char *suffix)
 {
@@ -556,10 +553,10 @@ static bool lua_script_ends_with(const char *text, const char *suffix)
     return text_len >= suffix_len && strcmp(text + text_len - suffix_len, suffix) == 0;
 }
 
-/*
- * 原地去除字符串首尾空白字符（空格/制表/回车/换行）。
- * 参数: text - 待处理字符串，可为 NULL
- * 返回: 去除首部空白后的指针（直接修改原字符串尾部）
+/**
+ * @brief 原地裁剪空格、制表、回车及换行。
+ * @param[in,out] text 独占可写 NUL 文本借用，可 NULL。
+ * @return 原块内裁剪后起点借用，NULL 输入返回 NULL，尾部写 NUL，无分配。
  */
 static char *lua_script_trim(char *text)
 {
@@ -572,11 +569,12 @@ static char *lua_script_trim(char *text)
     return text;
 }
 
-/*
- * 安全复制字符串到固定大小字段，NULL 输入视为空串。
- * 参数: dst - 目标缓冲区
- *       dst_size - 缓冲区大小
- *       src - 源字符串，可为 NULL
+/**
+ * @brief 将文本按容量截断复制到字段。
+ * @param[out] dst 独占输出数组借用，NULL 跳过。
+ * @param[in] dst_size 含 NUL 容量，零跳过。
+ * @param[in] src 调用期非重叠 NUL 借用，NULL 按空串。
+ * @post 有效输出始终 NUL 终止，无分配，无拥有权转移。
  */
 static void lua_script_copy_field(char *dst, size_t dst_size, const char *src)
 {
@@ -584,13 +582,13 @@ static void lua_script_copy_field(char *dst, size_t dst_size, const char *src)
     snprintf(dst, dst_size, "%s", src ? src : "");
 }
 
-/*
- * 拼接目录和文件名为完整路径，自动补全分隔符 '/'，缓冲区不足时返回失败。
- * 参数: out - 输出缓冲区
- *       out_size - 缓冲区大小
- *       dir - 目录路径
- *       name - 文件名
- * 返回: true 成功，false 缓冲区不足或参数无效
+/**
+ * @brief 拼接目录与名称并按需补斜杠。
+ * @param[out] out 独占输出数组借用，与输入不重叠。
+ * @param[in] out_size 含 NUL 容量。
+ * @param[in] dir 调用期非 NULL NUL 目录借用，内部长度受路径数组上限约束。
+ * @param[in] name 调用期非 NULL NUL 名称借用。
+ * @return 成功 true，参数无效或容量不足 false，失败不写输出，无分配。
  */
 static bool lua_script_join_path(char *out, size_t out_size, const char *dir, const char *name)
 {
@@ -608,12 +606,12 @@ static bool lua_script_join_path(char *out, size_t out_size, const char *dir, co
     return true;
 }
 
-/*
- * 构建 Lua 脚本根目录路径：workspace_dir/lua/（末尾确保有 '/'）。
- * 参数: ctx - 工具上下文（获取 workspace_dir）
- *       out_root - 输出缓冲区
- *       out_root_size - 缓冲区大小
- * 返回: true 成功，false 路径过长
+/**
+ * @brief 构造以斜杠结尾的工作区 lua 根路径。
+ * @param[in] ctx 调用期上下文借用，NULL/空工作区用默认目录。
+ * @param[out] out_root 独占路径数组借用，与输入不重叠。
+ * @param[in] out_root_size 含 NUL 容量。
+ * @return 成功 true，参数无效或容量不足 false，失败可能保留部分路径，无分配。
  */
 static bool lua_script_build_root(const cc_tool_context_t *ctx,
                                   char *out_root,
@@ -633,10 +631,10 @@ static bool lua_script_build_root(const cc_tool_context_t *ctx,
     return true;
 }
 
-/*
- * 路径安全检查：拒绝空路径、含 ".." 的目录穿越、含 '\' 或 ':' 的非法字符。
- * 参数: path - 待检查路径
- * 返回: true 不安全，false 通过安全检查
+/**
+ * @brief 检查空路径及双点、反斜杠、冒号。
+ * @param[in] path 调用期 NUL 借用，可 NULL。
+ * @return 含禁用文本或缺失为 true，否则 false，无分配。
  */
 static bool lua_script_path_is_unsafe(const char *path)
 {
@@ -646,15 +644,15 @@ static bool lua_script_path_is_unsafe(const char *path)
            strchr(path, ':') != NULL;
 }
 
-/*
- * 将 Lua 脚本路径解析为绝对路径和运行时路径，只接受 lua/name.lua 或裸文件名。
- * 参数: ctx - 工具上下文
- *       path - 输入路径
- *       out_abs - [出参] 绝对文件系统路径
- *       out_abs_size - 绝对路径缓冲区大小
- *       out_run_path - [出参] 运行时路径（lua/name.lua 格式）
- *       out_run_path_size - 运行时路径缓冲区大小
- * 返回: true 解析成功，false 路径不安全或超出范围
+/**
+ * @brief 构造工作区绝对路径与 lua/ 相对运行路径。
+ * @param[in] ctx 调用期上下文借用，可 NULL 用默认工作区。
+ * @param[in] path 调用期相对 .lua 路径借用，禁止双点、反斜杠、冒号及起始斜杠。
+ * @param[out] out_abs 独占绝对路径数组借用，与输入不重叠。
+ * @param[in] out_abs_size 绝对路径含 NUL 容量。
+ * @param[out] out_run_path 独占运行路径数组借用，与其他数组不重叠。
+ * @param[in] out_run_path_size 运行路径含 NUL 容量，内部调用统一为 192。
+ * @return 成功 true，校验/容量失败 false，失败输出可部分写入，无分配。
  */
 static bool lua_script_resolve_path(const cc_tool_context_t *ctx,
                                     const char *path,
@@ -684,12 +682,11 @@ static bool lua_script_resolve_path(const cc_tool_context_t *ctx,
     return true;
 }
 
-/*
- * 从 Lua 注释行中提取元数据值（如 "-- @name hello" → "hello"），
- * key 必须以注释体开头且后跟空格/制表/冒号。
- * 参数: body - 注释体（"-- " 之后的内容）
- *       key - 元数据键（如 "@name"）
- * 返回: 匹配成功时返回值部分的指针，否则 NULL
+/**
+ * @brief 从注释体起点匹配元数据键并跳过空白或冒号。
+ * @param[in] body 调用期 NUL 注释借用，可 NULL。
+ * @param[in] key 必填调用期 NUL 键名借用。
+ * @return body 内值部分借用，未匹配返回 NULL，无分配，返回值存活依赖 body。
  */
 static const char *lua_script_meta_value(const char *body, const char *key)
 {
@@ -702,10 +699,11 @@ static const char *lua_script_meta_value(const char *body, const char *key)
     return body;
 }
 
-/*
- * 向脚本信息的 comments 字段追加文本，用空格分隔多条注释。
- * 参数: info - 脚本信息结构体
- *       text - 待追加的注释文本
+/**
+ * @brief 在固定 comments 字段按空格追加并截断文本。
+ * @param[in,out] info 独占有效信息借用，NULL 跳过。
+ * @param[in] text 调用期非别名 NUL 借用，NULL/空跳过。
+ * @post 字段 NUL 终止，容量不足静默保留或截断，无分配。
  */
 static void lua_script_append_comment(lua_script_info_t *info, const char *text)
 {
@@ -719,10 +717,11 @@ static void lua_script_append_comment(lua_script_info_t *info, const char *text)
     snprintf(info->comments + used, sizeof(info->comments) - used, "%s", text);
 }
 
-/*
- * 从运行时路径中提取默认脚本名称（取最后一段文件名，去除 .lua 后缀）。
- * 参数: info - [出参] 脚本信息（写入 name 字段）
- *       run_path - 运行时路径（如 lua/hello.lua）
+/**
+ * @brief 从路径末段提取默认名称并去掉可见 .lua 后缀。
+ * @param[out] info 必填独占信息借用，只写 name 字段。
+ * @param[in] run_path 必填调用期 NUL 路径借用，与输出不重叠。
+ * @post 名称按字段容量截断，无分配，无拥有权转交。
  */
 static void lua_script_default_name(lua_script_info_t *info, const char *run_path)
 {
@@ -735,13 +734,15 @@ static void lua_script_default_name(lua_script_info_t *info, const char *run_pat
     }
 }
 
-/*
- * 解析 Lua 脚本文件头部注释元数据（@name/@summary/@args/@tags），获取文件大小和
- * 修改时间。解析前 24 行 "-- " 开头的注释，非元数据行拼入 comments 字段。
- * 参数: abs_path - 绝对文件路径
- *       run_path - 运行时路径
- *       info - [出参] 解析结果
- * 返回: true 成功，false 文件无法打开
+/**
+ * @brief 读取脚本并解析前 24 行头注释元数据及可选文件统计。
+ * @param[in] tool 调用期实例借用，要求文本读取端口，端口由工厂拥有。
+ * @param[in] ctx 调用期上下文借用，可 NULL 用默认工作区。
+ * @param[in] abs_path 调用期 NUL 绝对路径借用，供可选 stat 使用。
+ * @param[in] run_path 调用期 NUL 相对路径借用，供 root-scoped 读取使用。
+ * @param[out] info 必填独占结构，成功包含副本，失败可能部分写入。
+ * @return 读取解析成功 true，参数或读取失败 false，临时文件文本始终 free。
+ * @note 完整文件先读入再分析，stat 失败时统计为零，端口负责并发。
  */
 static bool lua_script_parse_info(const lua_tool_t *tool,
                                   const cc_tool_context_t *ctx,
@@ -808,11 +809,11 @@ static bool lua_script_parse_info(const lua_tool_t *tool,
     return true;
 }
 
-/*
- * 大小写不敏感的朴素子串搜索。
- * 参数: text - 被搜索文本，可为 NULL
- *       needle - 搜索关键词，NULL 或空串视为匹配
- * 返回: true 匹配，false 不匹配
+/**
+ * @brief 按 C locale 逐字节执行忽略大小写的子串搜索。
+ * @param[in] text 调用期 NUL 借用，可 NULL。
+ * @param[in] needle 调用期 NUL 借用，NULL/空匹配全部。
+ * @return 匹配 true，否则 false，无分配，非空关键词下 NULL 文本无匹配。
  */
 static bool lua_script_contains_ci(const char *text, const char *needle)
 {
@@ -831,12 +832,11 @@ static bool lua_script_contains_ci(const char *text, const char *needle)
     return false;
 }
 
-/*
- * 判断脚本是否匹配查询关键词，在 name/summary/args/tags/path/comments
- * 六个字段中进行大小写不敏感搜索。空查询匹配所有。
- * 参数: info - 脚本信息
- *       query - 查询关键词，NULL 或空串匹配所有
- * 返回: true 匹配，false 不匹配
+/**
+ * @brief 在六个元数据字段中匹配查询关键词。
+ * @param[in] info 非 NULL 调用期有效信息借用。
+ * @param[in] query 调用期 NUL 借用，NULL/空匹配全部。
+ * @return 任一字段忽略大小写匹配为 true，否则 false，无分配。
  */
 static bool lua_script_matches(const lua_script_info_t *info, const char *query)
 {
@@ -849,12 +849,12 @@ static bool lua_script_matches(const lua_script_info_t *info, const char *query)
            lua_script_contains_ci(info->comments, query);
 }
 
-/*
- * 将脚本信息格式化为可读文本追加到缓冲区，detail 控制是否输出 comments 字段。
- * 参数: buffer - 动态缓冲区
- *       info - 脚本信息
- *       detail - true 输出 comments 字段
- * 返回: true 成功，false 内存不足
+/**
+ * @brief 格式化脚本信息并按预算追加到缓冲。
+ * @param[in,out] buffer 独占输出状态借用，持有扩容块。
+ * @param[in] info 非 NULL 调用期有效信息借用。
+ * @param[in] detail 是否包含 comments 字段。
+ * @return 接纳/截断 true，格式化或分配失败 false，失败可能已有部分追加。
  */
 static bool lua_script_append_info(lua_tool_buffer_t *buffer,
                                    const lua_script_info_t *info,
@@ -887,12 +887,14 @@ static bool lua_script_append_info(lua_tool_buffer_t *buffer,
     return true;
 }
 
-/*
- * 按精确路径搜索单个 Lua 脚本（通过 "path" 参数指定），解析并返回完整元数据。
- * 参数: ctx - 工具上下文
- *       path - 脚本路径
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK 或错误
+/**
+ * @brief 按路径读取并交付一个脚本的详细元数据。
+ * @param[in] tool 调用期工具借用，持有工厂文件端口借用。
+ * @param[in] ctx 调用期上下文借用，可 NULL 用默认工作区。
+ * @param[in] path 调用期 NUL 相对脚本路径借用。
+ * @param[out] out_result 必填独占空结果，拥有字段由 cc_tool_result_cleanup。
+ * @return CC_OK 且 ok 表示查找结果，输出分配失败返回 OOM，系统诊断由 cc_result_free。
+ * @note 失败释放中间缓冲，文件端口负责并发。
  */
 static cc_result_t lua_script_search_path(const lua_tool_t *tool,
                                          const cc_tool_context_t *ctx,
@@ -919,14 +921,15 @@ static cc_result_t lua_script_search_path(const lua_tool_t *tool,
     return cc_result_ok();
 }
 
-/*
- * 遍历 lua/ 目录下所有 .lua 文件，按 query 关键词过滤（匹配 name/summary/args/
- * tags/path/comments），受 limit 上限约束。结果格式化输出到 out_result->text。
- * 参数: ctx - 工具上下文
- *       query - 搜索关键词，NULL 或空串返回所有
- *       limit - 最大返回条目数
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK 或错误
+/**
+ * @brief 枚举 lua 目录直接条目并按元数据关键词筛选。
+ * @param[in] tool 非 NULL 调用期工具借用，端口必须含 list_dir 和文本读取。
+ * @param[in] ctx 调用期上下文借用，可 NULL 用默认工作区。
+ * @param[in] query 调用期 NUL 关键词借用，NULL/空匹配全部。
+ * @param[in] limit 返回条目上限，非正用 20，大于 50 钳位到 50。
+ * @param[out] out_result 必填独占空结果，拥有字段由 cc_tool_result_cleanup。
+ * @return CC_OK 或 OOM，系统诊断由 cc_result_free，目录不可用作为成功说明文本交付。
+ * @note 列表、文件和中间缓冲按路径释放，读取失败跳过条目，端口负责并发。
  */
 static cc_result_t lua_script_search_all(const lua_tool_t *tool,
                                         const cc_tool_context_t *ctx,
@@ -1002,12 +1005,13 @@ static cc_result_t lua_script_search_all(const lua_tool_t *tool,
     return cc_result_ok();
 }
 
-/*
- * 脚本搜索分发：有 "path" 参数则精确搜索单个脚本，否则按 query+limit 搜索全部。
- * 参数: root - JSON 对象
- *       ctx - 工具上下文
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK 或错误
+/**
+ * @brief 根据 path 或 query/limit 分发脚本搜索。
+ * @param[in] tool 非 NULL 调用期工具借用，持有有效文件端口。
+ * @param[in] root 调用期 JSON 对象借用，字段借用不逸出。
+ * @param[in] ctx 调用期上下文借用，可 NULL。
+ * @param[out] out_result 必填独占空结果，拥有字段由 cc_tool_result_cleanup。
+ * @return 下层搜索状态，系统诊断由 cc_result_free，非空 path 优先。
  */
 static cc_result_t lua_script_search_call(const lua_tool_t *tool,
                                          cc_json_value_t *root,
@@ -1027,14 +1031,14 @@ static cc_result_t lua_script_search_call(const lua_tool_t *tool,
     return lua_script_search_all(tool, ctx, query, limit, out_result);
 }
 
-/*
- * Lua 工具总入口：根据 mode 分发到 driver_info / script_search / run_code / run_file
- * 四种子流程。run_code/run_file 通过 lua_runtime 执行并受 limits 约束。
- * 参数: self - lua_tool_t 实例
- *       args_json - JSON 参数字符串
- *       ctx - 工具上下文
- *       out_result - [出参] 工具调用结果
- * 返回: CC_OK 或系统错误
+/**
+ * @brief 同步分发驱动查询、脚本搜索、代码执行及文件执行。
+ * @param[in] self 调用期实例借用，NULL 按代码模式，实例不得与销毁并发。
+ * @param[in] args_json 调用期 NUL JSON 借用，NULL/空按空对象。
+ * @param[in] ctx 调用期上下文借用，可 NULL，取消令牌覆盖整个执行期。
+ * @param[out] out_result 必填独占空结果，入口初始化，拥有字段由 cc_tool_result_cleanup。
+ * @return CC_OK 时见 ok/error，参数输出 NULL 或诊断分配失败返回系统错误，由 cc_result_free。
+ * @note JSON 始终释放，执行状态独立，文件端口及 UI 同步由底层负责。
  */
 static cc_result_t lua_tool_call(void *self,
                                  const char *args_json,
@@ -1117,9 +1121,10 @@ static cc_result_t lua_tool_call(void *self,
     return cc_result_ok();
 }
 
-/*
- * 释放 lua_tool_t 工具实例内存。
- * 参数: self - 工具实例指针
+/**
+ * @brief 释放工具实例并结束文件端口借用。
+ * @param[in] self 转移拥有权的实例，可 NULL，调用者先等待在途调用完成。
+ * @post 实例失效，文件端口仍由工厂拥有。
  */
 static void lua_tool_destroy(void *self)
 {
@@ -1134,12 +1139,13 @@ static const cc_tool_vtable_t s_lua_tool_vtable = {
     lua_tool_destroy,
 };
 
-/*
- * 按指定 mode 创建 Lua 工具实例，分配 lua_tool_t 并挂载虚函数表。
- * 参数: ctx - 工具工厂上下文（当前未使用）
- *       out_tool - [出参] 接收创建的工具实例
- *       mode - 工具模式（CODE/FILE/DRIVER_QUERY/SCRIPT_QUERY）
- * 返回: CC_OK 成功，CC_ERR_INVALID_ARGUMENT 空输出，CC_ERR_OUT_OF_MEMORY 内存不足
+/**
+ * @brief 按模式创建持有文件端口借用的 Lua 工具。
+ * @param[in] ctx 工厂上下文借用，要求 root-scoped 文本读取、目录枚举及 stat。
+ * @param[out] out_tool 必填独占空槽，校验通过后清空，成功用 vtable destroy 回收实例。
+ * @param[in] mode 内部四种模式之一。
+ * @return CC_OK，参数/能力不足返回不支持，分配失败 OOM，诊断由 cc_result_free。
+ * @pre 工厂文件端口存活覆盖工具及其调用，不转移端口拥有权。
  */
 static cc_result_t lua_tool_create_mode(const cc_runtime_tool_factory_ctx_t *ctx,
                                         cc_tool_t *out_tool,
@@ -1168,11 +1174,11 @@ static cc_result_t lua_tool_create_mode(const cc_runtime_tool_factory_ctx_t *ctx
     return cc_result_ok();
 }
 
-/*
- * 创建 lua_run_code 工具实例（mode=CODE），允许 Agent 直接执行 Lua 源代码。
- * 参数: ctx - 工具工厂上下文
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 或错误
+/**
+ * @brief 创建代码执行工具。
+ * @param[in] ctx 调用期工厂借用，端口支持 root-scoped 读、枚举、stat，存活覆盖工具期。
+ * @param[out] out_tool 必填独占空槽，成功取得实例拥有权，用 vtable destroy 回收。
+ * @return 创建状态，能力/参数不足为不支持，OOM 为内存错误，诊断由 cc_result_free。
  */
 cc_result_t lua_run_code_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
                                      cc_tool_t *out_tool)
@@ -1180,11 +1186,11 @@ cc_result_t lua_run_code_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
     return lua_tool_create_mode(ctx, out_tool, LUA_TOOL_MODE_CODE);
 }
 
-/*
- * 创建 lua_run_file 工具实例（mode=FILE），允许 Agent 运行 lua/ 目录下的脚本文件。
- * 参数: ctx - 工具工厂上下文
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 或错误
+/**
+ * @brief 创建工作区脚本执行工具。
+ * @param[in] ctx 调用期工厂借用，端口支持 root-scoped 读、枚举、stat，存活覆盖工具期。
+ * @param[out] out_tool 必填独占空槽，成功取得实例拥有权，用 vtable destroy 回收。
+ * @return 创建状态，能力/参数不足为不支持，OOM 为内存错误，诊断由 cc_result_free。
  */
 cc_result_t lua_run_file_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
                                      cc_tool_t *out_tool)
@@ -1192,11 +1198,11 @@ cc_result_t lua_run_file_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
     return lua_tool_create_mode(ctx, out_tool, LUA_TOOL_MODE_FILE);
 }
 
-/*
- * 创建 lua_driver_info 工具实例（mode=DRIVER_QUERY），用于查询可用 Lua 驱动列表或单个驱动详情。
- * 参数: ctx - 工具工厂上下文
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 或错误
+/**
+ * @brief 创建驱动文档查询工具。
+ * @param[in] ctx 调用期工厂借用，端口支持 root-scoped 读、枚举、stat，存活覆盖工具期。
+ * @param[out] out_tool 必填独占空槽，成功取得实例拥有权，用 vtable destroy 回收。
+ * @return 创建状态，能力/参数不足为不支持，OOM 为内存错误，诊断由 cc_result_free。
  */
 cc_result_t lua_driver_info_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
                                     cc_tool_t *out_tool)
@@ -1204,11 +1210,11 @@ cc_result_t lua_driver_info_tool_create(const cc_runtime_tool_factory_ctx_t *ctx
     return lua_tool_create_mode(ctx, out_tool, LUA_TOOL_MODE_DRIVER_QUERY);
 }
 
-/*
- * 创建 lua_script_search 工具实例（mode=SCRIPT_QUERY），用于搜索/列出 workspace lua 目录下的可复用脚本。
- * 参数: ctx - 工具工厂上下文
- *       out_tool - [出参] 接收创建的工具实例
- * 返回: CC_OK 或错误
+/**
+ * @brief 创建脚本元数据搜索工具。
+ * @param[in] ctx 调用期工厂借用，端口支持 root-scoped 读、枚举、stat，存活覆盖工具期。
+ * @param[out] out_tool 必填独占空槽，成功取得实例拥有权，用 vtable destroy 回收。
+ * @return 创建状态，能力/参数不足为不支持，OOM 为内存错误，诊断由 cc_result_free。
  */
 cc_result_t lua_script_search_tool_create(const cc_runtime_tool_factory_ctx_t *ctx,
                                     cc_tool_t *out_tool)

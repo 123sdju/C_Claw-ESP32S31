@@ -3,6 +3,7 @@
 #include <stddef.h>
 
 #include "cc/core/cc_result.h"
+#include "cc/app/cc_cancel_token.h"
 #include "cc/ports/cc_filesystem.h"
 
 #define LUA_RUNTIME_DEFAULT_WORKSPACE_DIR "/usb0/workspace"
@@ -13,36 +14,37 @@ typedef struct lua_runtime_limits {
     size_t max_output_bytes;
     size_t max_heap_bytes;
     int timeout_ms;
+    cc_cancel_token_t *cancel_token; /**< 调用期取消令牌借用，NULL 禁用协作取消。 */
 } lua_runtime_limits_t;
 
-/*
- * 返回 Lua 运行时的默认资源限制（max_script_bytes=4096, max_output_bytes=2048,
- * max_heap_bytes=128KB, timeout_ms=1000）。
- * 返回: 填充默认值的 lua_runtime_limits_t 结构体
+/**
+ * @brief 获取脚本 4096 字节、输出 2048 字节、Lua 堆 128 KiB、超时 1000 ms 的默认限制。
+ * @return 按值结构，取消令牌 NULL，无分配，可并发调用。
  */
 lua_runtime_limits_t lua_runtime_default_limits(void);
 
-/*
- * 在受控的 Lua 沙箱中执行一段 Lua 代码字符串。
- * 沙箱限制：PSRAM 分配器、内存上限、输出缓冲上限、超时钩子。
- * 只开放 base/table/string/math 库，屏蔽 dofile/loadfile/require。
- * 提供 cclaw.* 驱动注册表和自定义 print()（输出到缓冲区）。
- * 参数: code     - Lua 源码字符串
- * 参数: limits   - 资源限制（NULL 则使用默认值）
- * 参数: out_text - 输出文本（调用方需 heap_caps_free 释放）
- * 返回: cc_result_t，CC_OK 表示成功
+/**
+ * @brief 在独立 PSRAM Lua 状态中同步执行文本，收集 print 和返回值。
+ * @param[in] code 调用期 NUL 源码借用，必填。
+ * @param[in] limits 调用期限制借用，NULL 用默认值，零资源字段规范为默认值。
+ * @param[out] out_text 必填空拥有槽，入口清空，成功输出由 heap_caps_free 回收。
+ * @return 状态及拥有诊断由 cc_result_free 回收，失败输出 NULL，无 PSRAM 返回不支持。
+ * @pre 取消令牌与输入存活覆盖调用，各 Lua 状态独占，底层驱动负责共享硬件同步。
+ * @note pcall/xpcall 保留，指令超时与取消为可捕获的协作错误，C 库及最终化禁钩子区间按自身实现运行。
  */
 cc_result_t lua_runtime_run_code(const char *code,
                                  const lua_runtime_limits_t *limits,
                                  char **out_text);
 
-/*
- * 读取并执行 Lua 脚本文件。路径安全校验后加载文件内容，调用 lua_runtime_run_code_named。
- * 参数: workspace_dir - 工作区根目录（NULL 则使用 /usb0/workspace）
- * 参数: path          - 脚本文件路径
- * 参数: limits        - 资源限制（NULL 则使用默认值）
- * 参数: out_text      - 输出文本（调用方需 heap_caps_free 释放）
- * 返回: cc_result_t，CC_OK 表示成功
+/**
+ * @brief 读取工作区 lua 子目录中的 .lua 文件并以独立状态执行。
+ * @param[in] filesystem 调用期 root-scoped 文本读取端口借用，负责并发与目录边界。
+ * @param[in] workspace_dir 调用期 NUL 根目录借用，NULL/空用默认目录。
+ * @param[in] path 调用期相对 .lua 路径借用，可省略 lua/。
+ * @param[in] limits 调用期限制借用，NULL 用默认值，取消令牌覆盖调用期。
+ * @param[out] out_text 必填空拥有槽，入口清空，成功由 heap_caps_free 回收。
+ * @return 状态及拥有诊断由 cc_result_free 回收，失败输出 NULL，文件内容由本函数释放。
+ * @note 文件完整读取后校验脚本大小，执行预算语义与 lua_runtime_run_code 相同。
  */
 cc_result_t lua_runtime_run_file(const cc_filesystem_t *filesystem,
                                  const char *workspace_dir,

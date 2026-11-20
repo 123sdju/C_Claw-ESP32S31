@@ -2,12 +2,10 @@
 
 #include <string.h>
 
-/*
- * 将日志级别字符串（"trace"/"debug"/"info"/"warn"/"error"/"fatal"）解析为枚举值。
- * 不区分大小写，无法识别时默认返回 CC_LOG_INFO。
- *
- * 参数: text - 日志级别字符串指针
- * 返回: 对应的 cc_log_level_t 枚举值
+/**
+ * @brief 按精确小写名称解析日志级别，保留 INFO 缺省。
+ * @param[in] text 调用期借用的 NUL 字符串，可为 NULL。
+ * @return trace/debug/warn/error/fatal 的对应级别，info、空值或未知拼写返回 INFO。
  */
 cc_log_level_t app_event_parse_log_level(const char *text)
 {
@@ -20,12 +18,7 @@ cc_log_level_t app_event_parse_log_level(const char *text)
     return CC_LOG_INFO;
 }
 
-/*
- * 将日志级别枚举值转为对应的字符串名称，用于日志格式化输出。
- *
- * 参数: level - cc_log_level_t 枚举值
- * 返回: 对应的常量字符串指针
- */
+/** @brief 提供日志级别的稳定文本。 @param[in] level 按值级别。 @return 静态小写名称借用，未知值为 info。 */
 const char *app_event_log_level_string(cc_log_level_t level)
 {
     switch (level) {
@@ -39,12 +32,11 @@ const char *app_event_log_level_string(cc_log_level_t level)
     }
 }
 
-/*
- * 将配置中的字符串列表转换为 sink 掩码，支持 "serial"/"web"/"display"/"usb_log"
- * 四种 sink 标识。静态函数，仅供本地路由配置使用。
- *
- * 参数: list - 配置字符串列表指针
- * 返回: 组合后的 sink 掩码
+/**
+ * @brief 将精确 sink 名称列表折叠为路由位集合。
+ * @param[in] list 配置列表借用，NULL 表示空路由，非零 count 须有对应 items 数组。
+ * @return serial/web/display/usb_log 的组合位，NULL 项、重复项及未知名称分别忽略或合并。
+ * @note 列表只在调用期读取，外层保持配置稳定，本函数不保留任何字符串。
  */
 static app_event_sink_mask_t sink_mask_from_list(const cc_config_string_list_t *list)
 {
@@ -61,12 +53,7 @@ static app_event_sink_mask_t sink_mask_from_list(const cc_config_string_list_t *
     return mask;
 }
 
-/*
- * 在持锁状态下查询指定事件种类的路由掩码，带越界保护。
- *
- * 参数: kind - 事件种类枚举值
- * 返回: 对应的 sink 掩码，越界时返回 0
- */
+/** @brief 在状态锁内读取指定种类路由。 @param[in] kind 按值种类，越界安全。 @return 已配置位集合，越界为零。 @pre 调用者持总线锁及有效资源租约，或处于独占初始化。 */
 app_event_sink_mask_t app_event_route_for_kind_locked(app_event_kind_t kind)
 {
     if ((unsigned)kind >= (sizeof(g_app_event_bus.route) / sizeof(g_app_event_bus.route[0]))) {
@@ -75,12 +62,11 @@ app_event_sink_mask_t app_event_route_for_kind_locked(app_event_kind_t kind)
     return g_app_event_bus.route[kind];
 }
 
-/*
- * 在持锁状态下根据 IO 配置填充所有事件种类的路由表。
- * chat 路由同时应用于 USER 和 ASSISTANT，status 路由同时应用于 STATUS 和 RUN_STATE。
- *
- * 参数: io - 运行时IO配置指针
- * 返回: 无
+/**
+ * @brief 从 IO 快照复制全部事件路由位，chat 与 status 各复用两个种类。
+ * @param[in] io 必需的稳定配置借用，各列表须满足 count/items 约束。
+ * @pre 调用者持状态锁，配置 owner 保持输入覆盖整个调用。
+ * @post USER/ASSISTANT 共用 chat，STATUS/RUN_STATE 共用 status，其余按对应列表更新，无字符串借用遗留。
  */
 void app_event_configure_routes_locked(const app_runtime_io_config_t *io)
 {
@@ -95,13 +81,7 @@ void app_event_configure_routes_locked(const app_runtime_io_config_t *io)
     g_app_event_bus.route[APP_EVENT_KIND_PROFILE] = sink_mask_from_list(&io->routes.profile);
 }
 
-/*
- * 在持锁状态下设置串口回退路由：将除 THINKING 外的所有事件种类路由到串口，
- * THINKING 路由设为 0（不输出）。在 IO 配置不可用时调用。
- *
- * 参数: 无
- * 返回: 无
- */
+/** @brief 安装缺省串口回退路由。 @pre 调用者持状态锁。 @post THINKING 路由清零，其他现有种类仅含 SERIAL。 */
 void app_event_configure_fallback_routes_locked(void)
 {
     g_app_event_bus.route[APP_EVENT_KIND_LOG] = APP_EVENT_SINK_SERIAL;
@@ -115,14 +95,12 @@ void app_event_configure_fallback_routes_locked(void)
     g_app_event_bus.route[APP_EVENT_KIND_PROFILE] = APP_EVENT_SINK_SERIAL;
 }
 
-/*
- * 将 sink 掩码转换为逗号分隔的可读字符串（如 "serial,web,display"），
- * 写入 out 缓冲区，末尾逗号自动去除。
- *
- * 参数: mask     - sink 掩码
- * 参数: out      - 输出缓冲区
- * 参数: out_size - 输出缓冲区大小
- * 返回: 无
+/**
+ * @brief 将可识别 sink 位按固定顺序写为逗号分隔文本。
+ * @param[in] mask 按值位集合，未知位忽略。
+ * @param[out] out 可选可写缓冲，NULL 或零容量直接返回。
+ * @param[in] out_size 缓冲字节数，含终止 NUL。
+ * @post 有效缓冲始终 NUL 结尾，按 serial/web/display/usb_log 顺序尝试完整片段，容量不足片段跳过，末逗号移除。
  */
 void app_event_sink_mask_string(app_event_sink_mask_t mask, char *out, size_t out_size)
 {
@@ -136,14 +114,13 @@ void app_event_sink_mask_string(app_event_sink_mask_t mask, char *out, size_t ou
     if (len > 0 && out[len - 1] == ',') out[len - 1] = '\0';
 }
 
-/*
- * 判断事件是否应路由到 USB 日志文件，需同时满足：USB日志已启用、
- * 路由包含 USB_LOG 位、日志级别不低于 USB 日志最低级别。
- *
- * 参数: kind  - 事件种类
- * 参数: level - 日志级别
- * 参数: route - 该事件的路由掩码
- * 返回: true 表示应写入 USB 日志文件
+/**
+ * @brief 按配置和级别决定 USB 路由意图。
+ * @param[in] kind 当前不参与判定的事件种类。
+ * @param[in] level 按值日志级别，所有种类都应用 USB 阈值。
+ * @param[in] route 已取得的路由位集合。
+ * @return USB 配置启用、路由含 USB_LOG 且级别达到阈值时为 true。
+ * @pre 调用者持状态锁，实际入队还需 sink 再检查生命周期与接纳状态。
  */
 bool app_event_route_to_usb_log(app_event_kind_t kind, cc_log_level_t level, app_event_sink_mask_t route)
 {
@@ -152,14 +129,13 @@ bool app_event_route_to_usb_log(app_event_kind_t kind, cc_log_level_t level, app
            level >= g_app_event_bus.usb_log_level;
 }
 
-/*
- * 判断事件是否应路由到串口输出，需同时满足：串口已启用（或处于回退调试模式）、
- * 路由包含 SERIAL 位。对于 LOG 类型事件还需检查日志级别是否满足串口级别阈值。
- *
- * 参数: kind  - 事件种类
- * 参数: level - 日志级别
- * 参数: route - 该事件的路由掩码
- * 返回: true 表示应向串口输出
+/**
+ * @brief 按串口开关、回退标志和 LOG 阈值决定路由。
+ * @param[in] kind 仅 LOG 类型应用普通级别阈值。
+ * @param[in] level 按值级别。
+ * @param[in] route 已取得的路由位集合，须含 SERIAL 才能通过。
+ * @return 串口或回退启用且满足路由/阈值时为 true，回退模式跳过 LOG 阈值。
+ * @pre 调用者持总线状态锁。
  */
 bool app_event_route_to_serial(app_event_kind_t kind, cc_log_level_t level, app_event_sink_mask_t route)
 {
@@ -173,13 +149,12 @@ bool app_event_route_to_serial(app_event_kind_t kind, cc_log_level_t level, app_
     return true;
 }
 
-/*
- * 判断事件是否应路由到 LCD 显示屏，需同时满足：显示屏已启用、
- * 路由包含 DISPLAY 位、且事件种类不是 LOG/RUN_STATE/PROFILE。
- *
- * 参数: kind  - 事件种类
- * 参数: route - 该事件的路由掩码
- * 返回: true 表示应输出到显示屏
+/**
+ * @brief 按显示配置及种类排除生成普通 LCD 路由意图。
+ * @param[in] kind 按值种类，LOG/RUN_STATE/PROFILE 排除。
+ * @param[in] route 已取得的路由位集合。
+ * @return 显示启用、含 DISPLAY 且种类通过时为 true，boot 专用入口另行处理。
+ * @pre 调用者持状态锁，队列接纳和 UI 可用性由 sink 再检查。
  */
 bool app_event_route_to_display(app_event_kind_t kind, app_event_sink_mask_t route)
 {

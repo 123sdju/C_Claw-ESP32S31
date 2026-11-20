@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mimetypes
 import os
 import re
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import parse
+from firmware_test_modes import FUNCTIONAL_CASES, STRESS_AXES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,7 @@ DEFAULT_HOST = "http://cclaw.local/"
 DEFAULT_SERIAL_PORT = "COM6"
 DEFAULT_BAUDRATE = 115200
 DEFAULT_OUTPUT_ROOT = ROOT / "outputs" / "long_run_dashboard"
+CPU_IDLE_STARVATION_THRESHOLD_PCT = 1.0
 ALL_TEST_ITEMS = [
     "status",
     "events",
@@ -96,6 +99,62 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def read_summary(directory: Path) -> dict[str, Any] | None:
+    candidates = []
+    for name in ("summary.json", "summary.final.json"):
+        path = directory / name
+        try:
+            modified = path.stat().st_mtime_ns
+        except OSError:
+            continue
+        value = read_json(path)
+        if value is not None:
+            sequence = value.get("report_sequence", 0)
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+                sequence = 0
+            candidates.append((modified, sequence, value))
+    if candidates:
+        # Atomic replacement preserves the temporary file's timestamp. A
+        # fallback written in the same clock tick needs publication ordering.
+        return max(candidates, key=lambda item: (item[0], item[1]))[2]
+    return None
+
+
+def valid_percentage(value: Any) -> float | None:
+    """只接受有限的 0..100 百分比，保留异常数据供质量提示使用。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0 or number > 100.0:
+        return None
+    return number
+
+
+def cpu_frame_is_valid(cpu: dict[str, Any]) -> bool:
+    """只接受新版带明确时间窗口的 CPU 快照。"""
+    if cpu.get("available") is not True or cpu.get("runtime_stats") is False:
+        return False
+    if cpu.get("valid") is not True:
+        return False
+    window_ms = cpu.get("window_ms")
+    if (isinstance(window_ms, bool) or not isinstance(window_ms, (int, float)) or
+            not math.isfinite(float(window_ms)) or float(window_ms) <= 0.0):
+        return False
+    return True
+
+
+def task_label(task: dict[str, Any]) -> str:
+    """用 task number 区分同名 FreeRTOS 任务。"""
+    name = str(task.get("name") or task.get("n") or "unknown")
+    raw_id = task.get("task_id") if "task_id" in task else task.get("id")
+    if raw_id is None or isinstance(raw_id, bool):
+        return name
+    try:
+        return f"{name} [id={int(raw_id)}]"
+    except (TypeError, ValueError):
+        return name
+
+
 def read_tail(path: Path, max_lines: int = 80) -> list[str]:
     """处理 scripts/long_run_dashboard.py 中的 read tail 逻辑。
 
@@ -153,16 +212,22 @@ def profile_snapshot_from_text(text: str) -> dict[str, Any]:
         r'\{"name":"(?P<name>[^"]+)".*?"cpu_pct":(?P<pct>[0-9]+(?:\.[0-9]+)?)'
     )
     compact_pattern = re.compile(
-        r'\{"n":"(?P<name>[^"]+)".*?"p":(?P<pct>[0-9]+(?:\.[0-9]+)?)'
+        r'\{(?:"(?:id|task_id)":-?\d+,)?"n":"(?P<name>[^"]+)".*?"p":(?P<pct>[0-9]+(?:\.[0-9]+)?)'
     )
     for pattern in (verbose_pattern, compact_pattern):
         for match in pattern.finditer(text):
             try:
                 raw = match.group(0)
                 task: dict[str, Any] = {"n": match.group("name"), "p": float(match.group("pct"))}
+                task_id_match = re.search(r'"(?:id|task_id)"\s*:\s*(-?\d+)', raw)
+                if task_id_match:
+                    task["id"] = int(task_id_match.group(1))
                 core_match = re.search(r'"c"\s*:\s*(-?\d+)', raw)
                 if core_match:
                     task["c"] = int(core_match.group(1))
+                core_p_match = re.search(r'"core_p"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
+                if core_p_match:
+                    task["core_p"] = float(core_p_match.group(1))
                 cp_match = re.search(r'"cp"\s*:\s*([0-9]+(?:\.[0-9]+)?)', raw)
                 if cp_match:
                     task["cp"] = float(cp_match.group(1))
@@ -205,23 +270,37 @@ def cpu_task_value(task: dict[str, Any]) -> tuple[str, float, int | None] | None
     该函数注释用于固定当前职责边界；输入输出约束、异常吞吐和文件/网络副作用应
     在实现变化时与项目文档同步维护。
     """
-    name = str(task.get("name") or task.get("n") or "unknown")
-    pct = task.get("core_pct")
+    raw_name = str(task.get("name") or task.get("n") or "unknown")
+    name = task_label(task)
+    # core_p 只有在固件能够确定任务绑定到某个核时才提供；p 是全系统份额，
+    # 不能直接画到 CPU0/CPU1 曲线上。
+    pct = task.get("core_p")
     if pct is None:
-        pct = task.get("cp")
+        pct = task.get("core_pct")
     if pct is None:
-        pct = task.get("cpu_pct")
-    if pct is None:
-        pct = task.get("p")
-    if not isinstance(pct, (int, float)):
+        return None
+    value = valid_percentage(pct)
+    if value is None:
         return None
     core = task.get("core")
     if core is None:
         core = task.get("c")
     core_id = int(core) if isinstance(core, int) and core >= 0 else None
-    if core_id is None and name.upper().startswith("IDLE") and name[-1:].isdigit():
-        core_id = int(name[-1])
-    return name, round(max(0.0, min(100.0, float(pct))), 2), core_id
+    if core_id is None and raw_name.upper().startswith("IDLE") and raw_name[-1:].isdigit():
+        core_id = int(raw_name[-1])
+    return name, round(value, 2), core_id
+
+
+def cpu_task_global_value(task: dict[str, Any]) -> tuple[str, float] | None:
+    """读取任务占全系统的份额，用于全局任务列表而不是单核曲线。"""
+    name = task_label(task)
+    pct = task.get("cpu_pct")
+    if pct is None:
+        pct = task.get("p")
+    if pct is None:
+        return None
+    value = valid_percentage(pct)
+    return None if value is None else (name, round(value, 2))
 
 
 def core_totals_from_cpu(cpu: dict[str, Any], core_samples: dict[int, dict[str, float]]) -> dict[int, float | None]:
@@ -234,15 +313,48 @@ def core_totals_from_cpu(cpu: dict[str, Any], core_samples: dict[int, dict[str, 
     core_pct = cpu.get("core_pct")
     if isinstance(core_pct, list):
         for idx, value in enumerate(core_pct):
-            if isinstance(value, (int, float)):
-                out[idx] = round(max(0.0, min(100.0, float(value))), 2)
-    for core_id, sample in core_samples.items():
-        if core_id in out:
-            continue
-        idle_name = f"IDLE{core_id}"
-        idle = sample.get(idle_name)
-        out[core_id] = None if idle is None else round(max(0.0, min(100.0, 100.0 - idle)), 2)
+            parsed = valid_percentage(value)
+            if parsed is not None:
+                out[idx] = round(parsed, 2)
+    for core_id in core_samples:
+        out.setdefault(core_id, None)
     return out
+
+
+def update_cpu_idle_quality(cpu: dict[str, Any], quality: dict[str, Any], low_streak: dict[str, int]) -> None:
+    """Record measured low-idle streaks separately from missing IDLE data."""
+    raw_idle = cpu.get("core_idle_pct")
+    raw_busy = cpu.get("core_pct")
+    expected = int(cpu.get("cores")) if isinstance(cpu.get("cores"), int) else 0
+    lengths = [len(value) for value in (raw_idle, raw_busy) if isinstance(value, list)]
+    if expected <= 0:
+        expected = max(lengths, default=0)
+    for index in range(expected):
+        key = str(index)
+        idle = None
+        idle_slot_present = isinstance(raw_idle, list) and index < len(raw_idle)
+        if idle_slot_present and raw_idle[index] is not None:
+            idle = valid_percentage(raw_idle[index])
+            if idle is None:
+                quality["invalid_value_count"] += 1
+        else:
+            busy = raw_busy[index] if isinstance(raw_busy, list) and index < len(raw_busy) else None
+            busy_value = valid_percentage(busy)
+            if busy_value is not None:
+                idle = 100.0 - busy_value
+            elif busy is not None:
+                quality["invalid_value_count"] += 1
+        if idle is None:
+            quality["idle_missing_samples"][key] = quality["idle_missing_samples"].get(key, 0) + 1
+            low_streak[key] = 0
+        elif idle <= CPU_IDLE_STARVATION_THRESHOLD_PCT:
+            quality["idle_low_samples"][key] = quality["idle_low_samples"].get(key, 0) + 1
+            low_streak[key] = low_streak.get(key, 0) + 1
+            quality["idle_low_max_streak"][key] = max(
+                quality["idle_low_max_streak"].get(key, 0), low_streak[key]
+            )
+        else:
+            low_streak[key] = 0
 
 
 def read_cpu_series(path: Path, max_lines: int = 900, max_points: int = 160, max_tasks: int = 6) -> dict[str, Any]:
@@ -254,6 +366,27 @@ def read_cpu_series(path: Path, max_lines: int = 900, max_points: int = 160, max
     core_rows: dict[int, list[dict[str, Any]]] = {}
     task_max: dict[int, dict[str, float]] = {}
     task_last: dict[int, dict[str, float]] = {}
+    global_task_max: dict[str, float] = {}
+    global_task_last: dict[str, float] = {}
+    global_task_samples: dict[str, int] = {}
+    quality = {
+        "valid_samples": 0,
+        "invalid_samples": 0,
+        "truncated_samples": 0,
+        "legacy_samples": 0,
+        "duplicate_samples": 0,
+        "unknown_core_task_rows": 0,
+        "invalid_value_count": 0,
+        "idle_starvation_threshold_pct": CPU_IDLE_STARVATION_THRESHOLD_PCT,
+        "idle_unavailable_samples": 0,
+        "idle_missing_samples": {},
+        "idle_low_samples": {},
+        "idle_low_max_streak": {},
+    }
+    seen_cpu_sample_keys: set[int] = set()
+    last_cpu_sample_seq: int | None = None
+    last_cpu_timestamp_ms: int | None = None
+    idle_low_streak: dict[str, int] = {}
     for line in read_tail(path, max_lines):
         try:
             row = json.loads(line)
@@ -266,26 +399,81 @@ def read_cpu_series(path: Path, max_lines: int = 900, max_points: int = 160, max
         if not isinstance(text, str) or "\"cpu\"" not in text:
             continue
         snapshot = profile_snapshot_from_text(text)
-        tasks = snapshot["tasks"]
-        if not tasks:
+        cpu = snapshot["cpu"] if isinstance(snapshot.get("cpu"), dict) else {}
+        raw_sample_seq = cpu.get("sample_seq")
+        if isinstance(raw_sample_seq, int) and not isinstance(raw_sample_seq, bool) and raw_sample_seq > 0:
+            raw_timestamp = snapshot.get("timestamp_ms")
+            timestamp_ms = int(raw_timestamp) if isinstance(raw_timestamp, (int, float)) else -1
+            if last_cpu_timestamp_ms is not None and timestamp_ms >= 0 and timestamp_ms < last_cpu_timestamp_ms:
+                seen_cpu_sample_keys.clear()
+                idle_low_streak.clear()
+            if last_cpu_sample_seq is not None and raw_sample_seq < last_cpu_sample_seq:
+                seen_cpu_sample_keys.clear()
+                idle_low_streak.clear()
+            if timestamp_ms >= 0:
+                last_cpu_timestamp_ms = timestamp_ms
+            last_cpu_sample_seq = raw_sample_seq
+            if raw_sample_seq in seen_cpu_sample_keys:
+                quality["duplicate_samples"] += 1
+                continue
+            seen_cpu_sample_keys.add(raw_sample_seq)
+        if cpu.get("available") is True and ("valid" not in cpu or "window_ms" not in cpu):
+            quality["legacy_samples"] += 1
+        if not cpu_frame_is_valid(cpu):
+            quality["invalid_samples"] += 1
+            if cpu.get("available") is True and cpu.get("reason") == "core_idle_missing":
+                quality["idle_unavailable_samples"] = quality.get("idle_unavailable_samples", 0) + 1
             continue
+        quality["valid_samples"] += 1
+        update_cpu_idle_quality(cpu, quality, idle_low_streak)
+        if cpu.get("truncated") is True:
+            quality["truncated_samples"] += 1
+        raw_total = cpu.get("total_pct")
+        if raw_total is not None and valid_percentage(raw_total) is None:
+            quality["invalid_value_count"] += 1
+        raw_core_pct = cpu.get("core_pct")
+        if isinstance(raw_core_pct, list):
+            quality["invalid_value_count"] += sum(
+                1 for value in raw_core_pct
+                if value is not None and valid_percentage(value) is None
+            )
+        tasks = snapshot["tasks"] if isinstance(snapshot.get("tasks"), list) else []
         core_samples: dict[int, dict[str, float]] = {}
         for task in tasks:
             if not isinstance(task, dict):
                 continue
+            global_value = cpu_task_global_value(task)
+            if global_value is not None:
+                global_name, global_pct = global_value
+                global_task_samples[global_name] = global_task_samples.get(global_name, 0) + 1
+                global_task_max[global_name] = max(global_task_max.get(global_name, 0.0), global_pct)
+                global_task_last[global_name] = global_pct
+            elif any(task.get(key) is not None for key in ("p", "cpu_pct")):
+                quality["invalid_value_count"] += 1
+            raw_core_value = next(
+                (task.get(key) for key in ("core_p", "core_pct") if task.get(key) is not None),
+                None,
+            )
+            if raw_core_value is not None and valid_percentage(raw_core_value) is None:
+                quality["invalid_value_count"] += 1
             parsed = cpu_task_value(task)
             if parsed is None:
+                raw_core = task.get("core") if "core" in task else task.get("c")
+                if raw_core is None or (isinstance(raw_core, int) and raw_core < 0):
+                    quality["unknown_core_task_rows"] += 1
                 continue
             name, value, core_id = parsed
             if core_id is None:
+                quality["unknown_core_task_rows"] += 1
                 continue
             sample = core_samples.setdefault(core_id, {})
             sample[name] = value
             task_max.setdefault(core_id, {})[name] = max(task_max.setdefault(core_id, {}).get(name, 0.0), value)
             task_last.setdefault(core_id, {})[name] = value
-        core_totals = core_totals_from_cpu(snapshot["cpu"], core_samples)
+        core_totals = core_totals_from_cpu(cpu, core_samples)
         timestamp = snapshot.get("timestamp_ms") or event.get("time_ms")
-        for core_id, sample in core_samples.items():
+        for core_id in sorted(set(core_totals) | set(core_samples)):
+            sample = core_samples.get(core_id, {})
             core_rows.setdefault(core_id, []).append(
                 {
                     "timestamp_ms": timestamp,
@@ -305,7 +493,21 @@ def read_cpu_series(path: Path, max_lines: int = 900, max_points: int = 160, max
             "task_max_pct": {name: round(max_for_core.get(name, 0.0), 2) for name in top_tasks},
             "task_last_pct": {name: round(last_for_core.get(name, 0.0), 2) for name in top_tasks},
         }
-    return {"cores": cores}
+    global_top = sorted(global_task_max, key=lambda name: global_task_max.get(name, 0.0), reverse=True)[:max_tasks]
+    quality["idle_low_streak"] = dict(sorted(idle_low_streak.items()))
+    quality["idle_missing_samples"] = dict(sorted(quality["idle_missing_samples"].items()))
+    quality["idle_low_samples"] = dict(sorted(quality["idle_low_samples"].items()))
+    quality["idle_low_max_streak"] = dict(sorted(quality["idle_low_max_streak"].items()))
+    return {
+        "cores": cores,
+        "tasks": {
+            "top_tasks": global_top,
+            "task_max_pct": {name: round(global_task_max.get(name, 0.0), 2) for name in global_top},
+            "task_last_pct": {name: round(global_task_last.get(name, 0.0), 2) for name in global_top},
+            "task_samples": {name: global_task_samples.get(name, 0) for name in global_top},
+        },
+        "quality": quality,
+    }
 
 
 def read_memory_series(path: Path, max_lines: int = 900, max_points: int = 160) -> dict[str, Any]:
@@ -376,7 +578,7 @@ class RunManager:
         for path in sorted(self.output_root.iterdir(), key=lambda p: p.name, reverse=True):
             if not path.is_dir():
                 continue
-            summary = read_json(path / "summary.json") or {}
+            summary = read_summary(path) or {}
             rows.append(
                 {
                     "run_id": path.name,
@@ -426,16 +628,16 @@ class RunManager:
             if stop_file.exists():
                 stop_file.unlink()
 
-            duration = str(config.get("duration") or "3h")
+            duration = str(config.get("duration") or "1h")
             host = str(config.get("host") or DEFAULT_HOST)
             serial_port = str(config.get("serial_port") or DEFAULT_SERIAL_PORT)
             baudrate = int(config.get("baudrate") or DEFAULT_BAUDRATE)
-            test_items = config.get("test_items") or ALL_TEST_ITEMS
-            if not isinstance(test_items, list):
-                test_items = ALL_TEST_ITEMS
-            test_items = [item for item in test_items if item in ALL_TEST_ITEMS]
-            if not test_items:
-                test_items = ["status", "events", "profile"]
+            mode = config.get("mode", "functional")
+            if mode not in {"functional", "stress"}:
+                raise ValueError("mode must be functional or stress")
+            test_items = config.get("functional_cases", FUNCTIONAL_CASES)
+            if not isinstance(test_items, list) or not test_items or set(test_items) - set(FUNCTIONAL_CASES):
+                raise ValueError("choose at least one valid functional case")
 
             cmd = [
                 sys.executable,
@@ -454,22 +656,28 @@ class RunManager:
                 run_id,
                 "--stop-file",
                 str(stop_file),
-                "--test-items",
+                "--mode",
+                mode,
+                "--functional-cases",
                 ",".join(test_items),
                 "--profile-level",
                 str(config.get("profile_level") or "basic"),
                 "--profile-interval-ms",
                 str(int(config.get("profile_interval_ms") or 5000)),
-                "--interval",
-                str(float(config.get("interval") or 5.0)),
-                "--conversation-interval",
-                str(float(config.get("conversation_interval") or 100.0)),
-                "--long-conversation-interval",
-                str(float(config.get("long_conversation_interval") or 300.0)),
-                "--long-conversation-turns",
-                str(int(config.get("long_conversation_turns") or 8)),
+                "--sample-interval",
+                str(float(config.get("sample_interval", 2))),
+                "--recovery-seconds",
+                str(float(config.get("recovery_seconds", 20))),
+                "--stage-seconds",
+                str(float(config.get("stage_seconds", 120))),
+                "--stress-clients",
+                str(config.get("stress_clients", "1,2,4,8,16")),
+                "--stress-rate",
+                str(float(config.get("stress_rate", 2))),
+                "--stress-axes",
+                str(config.get("stress_axes", ",".join(STRESS_AXES))),
                 "--event-poll-interval",
-                str(float(config.get("event_poll_interval") or 2.0)),
+                str(float(config.get("event_poll_interval", 0.5 if mode == "stress" else 2.0))),
                 "--http-timeout",
                 str(float(config.get("http_timeout") or 8.0)),
                 "--run-label",
@@ -528,7 +736,7 @@ class RunManager:
         在实现变化时与项目文档同步维护。
         """
         output_dir = self.output_root / run_id
-        summary = read_json(output_dir / "summary.json") or {}
+        summary = read_summary(output_dir) or {}
         latest_row = newest_jsonl_row(output_dir / "run_status.jsonl")
         serial_tail = read_tail(output_dir / "serial.log", 40)
         runner_tail = read_tail(output_dir / "runner.log", 80)
@@ -570,6 +778,11 @@ class RunManager:
                 "conversation.jsonl": (output_dir / "conversation.jsonl").exists(),
                 "long_conversation.jsonl": (output_dir / "long_conversation.jsonl").exists(),
                 "runner.log": (output_dir / "runner.log").exists(),
+                "functional_cases.jsonl": (output_dir / "functional_cases.jsonl").exists(),
+                "pressure_stages.jsonl": (output_dir / "pressure_stages.jsonl").exists(),
+                "pressure_requests.jsonl": (output_dir / "pressure_requests.jsonl").exists(),
+                "run_settings.json": (output_dir / "run_settings.json").exists(),
+                "device_config.redacted.json": (output_dir / "device_config.redacted.json").exists(),
             },
         }
 
@@ -631,30 +844,33 @@ INDEX_HTML = r"""<!doctype html>
 <main>
   <aside>
     <h2>测试配置</h2>
-    <label>测试名称</label><input id="run_label" placeholder="1小时压力测试">
+    <label>测试模式</label><select id="mode"><option value="functional">功能性与资源稳定性测试</option><option value="stress">压力边界测试（逐级加压）</option></select>
+    <p class="muted" id="modeHint"></p>
+    <label>测试名称</label><input id="run_label" placeholder="新固件验证">
     <label>设备地址</label><input id="host">
     <div class="grid">
       <div><label>串口</label><input id="serial_port"></div>
       <div><label>波特率</label><input id="baudrate" type="number"></div>
     </div>
     <div class="grid">
-      <div><label>测试时长</label><input id="duration" value="1h"></div>
-      <div><label>循环间隔（秒）</label><input id="interval" type="number" value="5"></div>
+      <div><label id="durationLabel">测试时长</label><input id="duration" value="1h"></div>
+      <div><label>状态采样间隔（秒）</label><input id="sample_interval" type="number" value="2"></div>
     </div>
     <div class="grid">
-      <div><label>Profile 等级</label><select id="profile_level"><option>trace</option><option>trace</option><option>keep</option></select></div>
+      <div><label>Profile 等级</label><select id="profile_level"><option>basic</option><option>trace</option><option>keep</option></select></div>
       <div><label>Profile 间隔（毫秒）</label><input id="profile_interval_ms" type="number" value="5000"></div>
     </div>
     <div class="grid">
-      <div><label>短对话间隔（秒）</label><input id="conversation_interval" type="number" value="100"></div>
-      <div><label>长对话间隔（秒）</label><input id="long_conversation_interval" type="number" value="300"></div>
-    </div>
-    <div class="grid">
-      <div><label>长对话轮数</label><input id="long_conversation_turns" type="number" value="8"></div>
+      <div><label>降载观察（秒）</label><input id="recovery_seconds" type="number" value="20"></div>
       <div><label>HTTP 超时（秒）</label><input id="http_timeout" type="number" value="8"></div>
     </div>
-    <label>测试项目</label>
-    <div class="checks" id="testItems"></div>
+    <div id="functionalOptions"><label>功能清单（逐项验证，循环执行）</label><div class="checks" id="testItems"></div></div>
+    <div id="stressOptions" hidden>
+      <label>压力维度</label><select id="stress_axes"><option value="http,commands,lua_cpu,lua_memory">全部四项</option><option value="http">Web 并发</option><option value="commands">命令队列</option><option value="lua_cpu">Lua 计算量</option><option value="lua_memory">Lua 内存申请</option></select>
+      <label>并发阶梯</label><input id="stress_clients" value="1,2,4,8,16">
+      <div class="grid"><div><label>每级持续（秒）</label><input id="stage_seconds" type="number" value="120"></div><div><label>每客户端请求/秒</label><input id="stress_rate" type="number" value="2"></div></div>
+      <p class="muted">每级降载检查恢复，再复验最后通过级别。达到最高档仍通过时，只报告已测下界；Lua 超时与堆上限单独标记。</p>
+    </div>
     <div class="checks">
       <label class="check"><input id="dry_run" type="checkbox"> 只做 dry-run</label>
       <label class="check"><input id="no_serial" type="checkbox"> 禁用串口</label>
@@ -670,7 +886,9 @@ INDEX_HTML = r"""<!doctype html>
   </aside>
   <section>
     <h2>实时状态</h2>
+    <h2>测试结论与边界</h2><pre id="modeResults">尚未开始</pre>
     <div class="progress"><div id="progressBar"></div></div>
+    <p class="muted" id="progressNote"></p>
     <div class="cards" id="cards"></div>
     <div class="chartPanel">
       <div class="chartHead">
@@ -685,6 +903,13 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <canvas id="cpuChart1" width="980" height="240"></canvas>
       <div class="legend" id="cpuLegend1"></div>
+    </div>
+    <div class="chartPanel">
+      <div class="chartHead">
+        <h2 style="margin:0">全系统任务运行份额</h2>
+        <div class="muted" id="cpuTaskNote">等待 profile CPU 数据</div>
+      </div>
+      <pre id="cpuTasksBox">暂无有效 CPU 任务数据</pre>
     </div>
     <div class="chartPanel">
       <div class="chartHead">
@@ -708,12 +933,8 @@ const itemLabels = {
   profile: "性能与资源指标",
   ota_status: "OTA 状态",
   config_audit: "配置风险审计",
-  fault_ota_reject: "OTA 拒绝探针",
-  fault_web_timeout: "Web 超时探针",
-  network_commands: "网络命令",
-  serial_commands: "串口命令",
-  short_conversation: "短对话",
-  long_conversation: "长对话"
+  serial: "串口命令与设备执行事件", lua: "Lua 运算", file_io: "USB 文件写入/读回", lua_file: "Lua 文件执行",
+  display: "屏幕驱动调用（显示需目视）", llm: "模型流式问答", context: "多轮上下文", camera: "相机工具调用（图像需人工确认）", memory: "记忆工具只读调用"
 };
 let selectedRun = null;
 let eventSource = null;
@@ -733,26 +954,29 @@ function formatDuration(seconds){
   return `${s}秒`;
 }
 function renderItems(items){
-  el("testItems").innerHTML = items.map(item => `<label class="check"><input type="checkbox" data-item="${item}" checked> ${itemLabels[item] || item}</label>`).join("");
+  el("testItems").innerHTML = items.map(item => `<label class="check"><input type="checkbox" data-item="${item}" ${item.startsWith("fault_") ? "" : "checked"}> ${itemLabels[item] || item}</label>`).join("");
 }
 function selectedItems(){
   return [...document.querySelectorAll("[data-item]")].filter(i => i.checked).map(i => i.dataset.item);
 }
 function config(){
   return {
+    mode: value("mode"),
     run_label: value("run_label"),
     host: value("host"),
     serial_port: value("serial_port"),
     baudrate: Number(value("baudrate")),
     duration: value("duration"),
-    interval: Number(value("interval")),
+    sample_interval: Number(value("sample_interval")),
+    recovery_seconds: Number(value("recovery_seconds")),
+    stage_seconds: Number(value("stage_seconds")),
+    stress_clients: value("stress_clients"),
+    stress_rate: Number(value("stress_rate")),
+    stress_axes: value("stress_axes"),
     profile_level: value("profile_level"),
     profile_interval_ms: Number(value("profile_interval_ms")),
-    conversation_interval: Number(value("conversation_interval")),
-    long_conversation_interval: Number(value("long_conversation_interval")),
-    long_conversation_turns: Number(value("long_conversation_turns")),
     http_timeout: Number(value("http_timeout")),
-    test_items: selectedItems(),
+    functional_cases: selectedItems(),
     dry_run: checked("dry_run"),
     no_serial: checked("no_serial"),
     no_profile_guard: checked("no_profile_guard")
@@ -827,7 +1051,7 @@ function drawOneCpuCoreChart(coreId, series){
   }
   if (!points.length || !lines.length) {
     ctx.fillStyle = "#667085";
-    ctx.fillText(`没有 CPU${coreId} 百分比数据：请确认固件 profile 包含 cpu.core_pct 和 task.c/cp`, padL, padT + 32 * ratio);
+    ctx.fillText(`没有 CPU${coreId} 曲线数据：请确认固件 profile 包含 core_pct；任务曲线仅显示已知 core_p`, padL, padT + 32 * ratio);
     return;
   }
   lines.forEach((name, i) => {
@@ -858,6 +1082,29 @@ function drawCpuChart(series){
   const cores = (series && series.cores) || {};
   drawOneCpuCoreChart(0, cores["0"] || {});
   drawOneCpuCoreChart(1, cores["1"] || {});
+}
+function renderCpuTasks(series){
+  const tasks = (series && series.tasks) || {};
+  const quality = (series && series.quality) || {};
+  const names = tasks.top_tasks || [];
+  const box = el("cpuTasksBox");
+  const idleStreak = quality.idle_low_max_streak || {};
+  const idleText = Object.keys(idleStreak).map(core => `CPU${core}=${idleStreak[core]}`).join(", ");
+  el("cpuTaskNote").textContent = quality.valid_samples
+    ? `有效窗口 ${quality.valid_samples}，重复缓存 ${quality.duplicate_samples || 0}，旧格式忽略 ${quality.legacy_samples || 0}，未绑核任务行 ${quality.unknown_core_task_rows || 0}，Top-N 省略窗口 ${quality.truncated_samples || 0}${idleText ? `，低空闲最长连续 ${idleText}` : ""}`
+    : (quality.legacy_samples ? `已忽略 ${quality.legacy_samples} 个旧版 CPU Profile，请重新烧录新版固件` : "等待有效 CPU 时间窗口");
+  if (!names.length) {
+    box.textContent = quality.legacy_samples
+      ? "暂无有效 CPU 任务数据：当前事件是旧版 Profile，已忽略其 cp/旧 p 字段，请重新烧录新版固件。"
+      : "暂无有效 CPU 任务数据；首个 profile 只是基线，未绑定核心的任务不会画入 CPU0/CPU1 曲线。";
+    return;
+  }
+  box.textContent = names.map(name => {
+    const samples = tasks.task_samples && tasks.task_samples[name] || 0;
+    const last = tasks.task_last_pct && tasks.task_last_pct[name] != null ? tasks.task_last_pct[name] : "n/a";
+    const max = tasks.task_max_pct && tasks.task_max_pct[name] != null ? tasks.task_max_pct[name] : "n/a";
+    return `${name}: samples=${samples}, 当前=${last}%, 最大=${max}%（占全系统）`;
+  }).join("\n");
 }
 function drawMemoryChart(series){
   const canvas = el("memoryChart");
@@ -926,16 +1173,25 @@ function drawMemoryChart(series){
 }
 function renderStatus(data){
   const s = data.summary || {};
+  const stress = s.mode === "stress";
   selectedRun = data.run_id;
   el("activeLine").textContent = data.active ? `运行中：${data.run_id}` : `已选择：${data.run_id}`;
   el("stopBtn").disabled = !data.active;
   const progress = data.progress_percent ?? 0;
   el("progressBar").style.width = `${Math.max(0, Math.min(100, progress))}%`;
+  const searchEnd = s.stop_reason === "boundary_search_inconclusive"
+    ? "搜索流程已结束，但存在观测不确定或复验失败，请查看各维度证据。"
+    : s.stop_reason === "boundary_search_complete" ? "边界搜索已结束；不代表所有负载均通过或已找到整板极限。" : "";
+  el("progressNote").textContent = stress
+    ? `进度条表示搜索预算已用比例，不是阶梯完成率。搜索结束可早于预算时长。${searchEnd}`
+    : "进度条表示测试时长已用比例。";
   el("cards").innerHTML = [
+    card("模式", s.mode === "stress" ? "压力边界" : "功能稳定性"),
+    card("结论", s.verdict || "待采样"),
     card("停止原因", s.stop_reason),
     card("已运行", formatDuration(data.live_elapsed_seconds ?? s.elapsed_seconds)),
-    card("目标时长", data.requested_duration_seconds ? formatDuration(data.requested_duration_seconds) : "n/a"),
-    card("预计剩余", data.remaining_seconds == null ? "n/a" : formatDuration(data.remaining_seconds)),
+    card(stress ? "搜索预算上限" : "目标时长", data.requested_duration_seconds ? formatDuration(data.requested_duration_seconds) : "n/a"),
+    card(stress ? "剩余预算（非预计耗时）" : "预计剩余", !data.active ? "已结束" : data.remaining_seconds == null ? "n/a" : formatDuration(data.remaining_seconds)),
     card("HTTP OK/errors", `${s.http_ok || 0}/${s.http_errors || 0}`),
     card("事件序号丢失", s.event_seq_gap_lost || 0),
     card("首 token p95", metric(s, "first_token_summary_ms.p95")),
@@ -943,7 +1199,22 @@ function renderStatus(data){
     card("最低 heap", s.profile_min_internal_heap ?? s.min_internal_heap),
     card("Attempt 不一致", s.llm_attempt_consistency_mismatch)
   ].join("");
+  const results = s.mode === "stress" ? Object.entries(s.boundaries || {}).map(([axis,b]) => ({
+    axis, last_passing: b.last_passing?.load ?? null, confirmed: b.confirmed,
+    first_limit: b.first_limit?.load ?? null, reason: b.first_limit?.reasons ?? [],
+    inconclusive_stage: b.inconclusive_stage?.load ?? null,
+    observation_issue: b.inconclusive_stage?.observation_issue ?? b.first_limit?.observation_issue ?? null,
+    observation_reasons: b.inconclusive_stage?.reasons ?? [],
+    error_categories: (b.inconclusive_stage ?? b.first_limit)?.metrics?.error_categories ?? {},
+    connection_plan: (b.inconclusive_stage ?? b.first_limit ?? b.last_passing)?.connection_plan ?? null,
+    recovery: (b.inconclusive_stage ?? b.first_limit)?.recovery ?? null,
+    warmup_repeat: b.warmup_repeat?.verdict ?? null,
+    camera_processing: (b.inconclusive_stage ?? b.first_limit ?? b.last_passing)?.camera_processing ?? null,
+    kind: b.first_limit?.limit_kind, interpretation: b.interpretation ?? "进行中"
+  })) : (s.functional_cases || []).slice(-30);
+  el("modeResults").textContent = JSON.stringify({verdict:s.verdict, cases_or_boundaries:results, resource_stability:s.resource_stability?.stability, manual:s.manual_coverage},null,2);
   drawCpuChart(data.cpu_series || {});
+  renderCpuTasks(data.cpu_series || {});
   drawMemoryChart(data.memory_series || {});
   if (Object.keys(s).length || data.latest_row) {
     el("summaryBox").textContent = JSON.stringify({summary:s, latest_row:data.latest_row}, null, 2);
@@ -990,7 +1261,15 @@ async function init(){
   el("host").value = d.host;
   el("serial_port").value = d.serial_port;
   el("baudrate").value = d.baudrate;
-  renderItems(d.test_items);
+  renderItems(d.functional_cases);
+  el("mode").onchange = () => {
+    const stress = value("mode") === "stress";
+    el("functionalOptions").hidden = stress;
+    el("stressOptions").hidden = !stress;
+    el("durationLabel").textContent = stress ? "搜索预算上限（可提前结束）" : "测试时长";
+    el("modeHint").textContent = stress ? "逐级增加负载，记录最后通过级别、首个限制级别和恢复情况。1h 是最多搜索一小时；所有维度处理完即结束，不会补足时长。观测不确定也可能结束搜索，需查看报告原因。" : "逐项验证功能，重复运行并比较空闲内存、CPU 和事件完整性。";
+  };
+  el("mode").onchange();
   el("startBtn").onclick = startRun;
   el("stopBtn").onclick = stopRun;
   el("refreshBtn").onclick = refreshSelectedRun;
@@ -1067,6 +1346,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "serial_port": DEFAULT_SERIAL_PORT,
                     "baudrate": DEFAULT_BAUDRATE,
                     "test_items": ALL_TEST_ITEMS,
+                    "functional_cases": FUNCTIONAL_CASES,
                     "default_output_root": str(self.manager.output_root),
                 }
             )
@@ -1146,6 +1426,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         在实现变化时与项目文档同步维护。
         """
         allowed = {
+            "functional_cases.jsonl", "pressure_stages.jsonl", "pressure_requests.jsonl",
+            "run_settings.json", "device_config.redacted.json",
             "summary_report.txt",
             "summary.json",
             "run_status.jsonl",

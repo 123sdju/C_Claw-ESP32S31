@@ -1,11 +1,10 @@
 #include "app_lifecycle.h"
 
-/*
- * ESP-IDF 应用主入口。
- *
- * FreeRTOS 启动后第一个用户任务从此函数开始执行，
- * 直接委托给 app_lifecycle_run() 进入生命周期主循环。
- * 此函数永不返回。
+/**
+ * @brief 从 ESP-IDF 主任务进入 CClaw 应用生命周期编排。
+ * @post 正常启动后驻留在 app_lifecycle_run 的 USB 热插拔循环中。
+ *       若启动编排在失败清理后返回，本入口随之返回。
+ * @note 生命周期编排负责初始化全局组合根及服务，本入口仅完成调用交接。
  */
 void app_main(void)
 {
